@@ -1,0 +1,47 @@
+[package]
+name = "oximon"
+version = "0.1.0"
+edition = "2024"
+description = "Network monitor: TUI + daemon. ARP scan, vendor lookup, auto port intensive, notifications."
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "oximon"
+path = "src/bin/oximon.rs"
+
+[[bin]]
+name = "oximond"
+path = "src/bin/oximond.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+pnet = "0.35"
+notify-rust = "4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+csv = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5"
+quick-xml = { version = "0.36", features = ["serialize"] }
+dns-lookup = "2"
+ksni = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

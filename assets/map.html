@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oximon · network map</title>
+<style>
+:root{
+  --bg:#070a0f;
+  --panel:#0f141c;
+  --panel-2:#141a24;
+  --border:#1e2533;
+  --text:#d7dde8;
+  --muted:#6a7689;
+  --green:#34d399;
+  --red:#f87171;
+  --yellow:#fbbf24;
+  --cyan:#22d3ee;
+  --purple:#c084fc;
+  --accent:#60a5fa;
+  --grid:#0c1118;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+  font:13px/1.5 ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  height:100vh;overflow:hidden}
+
+header{position:fixed;top:0;left:0;right:0;height:52px;padding:0 20px;
+  background:linear-gradient(180deg,var(--panel) 0%,var(--panel-2) 100%);
+  border-bottom:1px solid var(--border);display:flex;align-items:center;gap:20px;z-index:10;
+  backdrop-filter:blur(8px)}
+.brand{font-weight:700;color:var(--accent);font-size:16px;letter-spacing:1px;
+  text-shadow:0 0 10px rgba(96,165,250,.3)}
+.brand::before{content:"\25C9 ";color:var(--green);animation:pulse 2s ease-in-out infinite}
+.brand.live::before{color:var(--cyan)}
+.brand.disconnected::before{color:var(--red);animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.stats{display:flex;gap:16px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.stats .kv{display:flex;flex-direction:column}
+.stats .k{font-size:10px}
+.stats .v{color:var(--text);font-size:13px;font-weight:600;text-transform:none}
+.stats .v.green{color:var(--green)}
+.stats .v.cyan{color:var(--cyan)}
+.stats .v.yellow{color:var(--yellow)}
+.progress{display:flex;align-items:center;gap:10px;padding:0 10px;border-left:1px solid var(--border);border-right:1px solid var(--border);height:32px}
+.progress .p-item{display:flex;flex-direction:column;gap:1px}
+.progress .p-k{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.progress .p-v{font-size:12px;color:var(--text);font-weight:600}
+.progress .dot{width:8px;height:8px;border-radius:50%;background:#334155;transition:all .2s}
+.progress .dot.on{background:var(--cyan);box-shadow:0 0 8px rgba(34,211,238,.6);animation:pulse 1s ease-in-out infinite}
+.progress .p-v.active{color:var(--yellow)}
+.progress .p-v.zero{color:var(--muted)}
+.progbar{position:fixed;top:52px;left:0;right:400px;height:2px;background:transparent;z-index:9;pointer-events:none}
+.progbar .bar{height:100%;background:linear-gradient(90deg,var(--cyan),var(--accent));width:0;transition:width .3s ease;
+  box-shadow:0 0 10px rgba(34,211,238,.5)}
+.progbar.active .bar{width:100%;animation:indet 1.5s ease-in-out infinite}
+@keyframes indet{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
+
+.actions{display:flex;gap:6px;margin-left:auto}
+.actions button{background:var(--panel-2);border:1px solid var(--border);color:var(--text);
+  padding:6px 10px;border-radius:6px;font-family:inherit;font-size:11px;cursor:pointer;transition:all .1s}
+.actions button:hover{border-color:var(--accent);color:var(--accent)}
+.actions button.muted{color:var(--red);border-color:var(--red)}
+.actions button:disabled{opacity:.4;cursor:wait}
+#search{background:var(--bg);border:1px solid var(--border);color:var(--text);
+  padding:8px 12px;border-radius:6px;font-family:inherit;font-size:12px;width:240px;transition:all .15s}
+#search:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(96,165,250,.15)}
+#search::placeholder{color:var(--muted)}
+
+main{position:fixed;top:52px;left:0;right:400px;bottom:0;
+  background-image:
+    radial-gradient(ellipse at center,rgba(96,165,250,.05) 0%,transparent 70%),
+    linear-gradient(var(--grid) 1px,transparent 1px),
+    linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+  background-size:100% 100%,40px 40px,40px 40px}
+#cy{width:100%;height:100%}
+
+aside{position:fixed;top:52px;right:0;bottom:0;width:400px;background:var(--panel);
+  border-left:1px solid var(--border);overflow-y:auto;overflow-x:hidden}
+aside::-webkit-scrollbar{width:8px}
+aside::-webkit-scrollbar-track{background:var(--panel)}
+aside::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+
+.empty{padding:40px 20px;text-align:center;color:var(--muted);font-size:12px}
+.empty .ico{display:block;font-size:48px;margin-bottom:16px;color:var(--border)}
+
+.card{padding:16px 20px;border-bottom:1px solid var(--border)}
+.card h2{margin:0 0 4px 0;font-size:15px;color:var(--text);font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.badge{display:inline-block;padding:2px 8px;font-size:10px;
+  font-weight:500;text-transform:uppercase;border-radius:4px;letter-spacing:.5px}
+.badge.on{background:rgba(52,211,153,.15);color:var(--green);border:1px solid rgba(52,211,153,.3)}
+.badge.off{background:rgba(248,113,113,.15);color:var(--red);border:1px solid rgba(248,113,113,.3)}
+.badge.gw{background:rgba(251,191,36,.15);color:var(--yellow);border:1px solid rgba(251,191,36,.3)}
+.card .sub{color:var(--muted);font-size:11px;margin-bottom:8px}
+
+.kv-grid{display:grid;grid-template-columns:90px 1fr;gap:4px 16px;font-size:12px;margin-top:8px}
+.kv-grid .k{color:var(--muted);text-transform:uppercase;font-size:10px;letter-spacing:.5px;padding-top:2px}
+.kv-grid .v{color:var(--text);word-break:break-all}
+.kv-grid .v.mono{font-family:inherit;color:var(--cyan)}
+.kv-grid .v.dim{color:var(--muted);font-style:italic}
+
+.actions-row{display:flex;gap:6px;margin-top:12px;flex-wrap:wrap}
+.actions-row button{background:var(--panel-2);border:1px solid var(--border);color:var(--text);
+  padding:6px 10px;border-radius:6px;font-family:inherit;font-size:11px;cursor:pointer;transition:all .1s}
+.actions-row button:hover{border-color:var(--accent);color:var(--accent)}
+.actions-row button:disabled{opacity:.4;cursor:wait}
+.actions-row label{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:11px;padding:6px 10px}
+.actions-row input[type=checkbox]{accent-color:var(--accent)}
+
+.section-title{margin:0 0 8px 0;font-size:11px;color:var(--muted);
+  text-transform:uppercase;letter-spacing:1px;display:flex;align-items:center;gap:8px}
+.section-title::after{content:"";flex:1;height:1px;background:var(--border)}
+
+.ports{width:100%;border-collapse:collapse;font-size:11px}
+.ports th{text-align:left;color:var(--muted);border-bottom:1px solid var(--border);
+  padding:6px 8px;font-weight:500;text-transform:uppercase;font-size:10px;letter-spacing:.5px}
+.ports td{padding:6px 8px;border-bottom:1px solid var(--border)}
+.ports tr:last-child td{border-bottom:none}
+.ports tr:hover td{background:var(--panel-2)}
+.ports .port{color:var(--cyan);font-weight:600}
+.ports .svc{color:var(--purple)}
+.ports .banner{color:var(--muted);font-size:10px;max-width:180px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.events{font-size:11px}
+.events .ev{display:grid;grid-template-columns:70px 90px 1fr;gap:8px;padding:6px 0;
+  border-bottom:1px solid var(--border)}
+.events .ev:last-child{border-bottom:none}
+.events .ts{color:var(--muted);font-size:10px}
+.events .kind{font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.events .detail{color:var(--muted);font-size:11px;word-break:break-all}
+.events .k-connect{color:var(--green)}
+.events .k-disconnect{color:var(--red)}
+.events .k-intensive_done{color:var(--cyan)}
+.events .k-ip_change,.events .k-hostname_change{color:var(--yellow)}
+
+footer{position:fixed;bottom:8px;left:12px;color:var(--muted);font-size:10px;z-index:5;
+  background:rgba(7,10,15,.8);padding:4px 8px;border-radius:4px;backdrop-filter:blur(4px)}
+
+.controls{position:fixed;bottom:12px;left:50%;transform:translateX(-50%);z-index:5;
+  display:flex;gap:4px;background:var(--panel);border:1px solid var(--border);
+  border-radius:8px;padding:4px;backdrop-filter:blur(8px)}
+.controls button{background:transparent;border:none;color:var(--muted);padding:6px 10px;
+  font-family:inherit;font-size:11px;cursor:pointer;border-radius:4px;transition:all .1s}
+.controls button:hover{background:var(--panel-2);color:var(--text)}
+.controls button.active{background:var(--accent);color:#fff}
+
+.legend{position:fixed;top:68px;left:16px;z-index:5;background:rgba(15,20,28,.8);
+  border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-size:10px;
+  backdrop-filter:blur(8px);display:flex;flex-direction:column;gap:6px}
+.legend .row{display:flex;align-items:center;gap:8px;color:var(--muted)}
+.legend .dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.legend .dot.gw{background:var(--yellow);border-radius:2px}
+.legend .dot.on{background:var(--green);box-shadow:0 0 6px rgba(52,211,153,.5)}
+.legend .dot.off{background:#334155}
+.legend .dot.portful{background:var(--cyan);box-shadow:0 0 6px rgba(34,211,238,.5)}
+
+.toast{position:fixed;top:68px;right:20px;background:var(--panel);border:1px solid var(--border);
+  color:var(--text);padding:10px 14px;border-radius:6px;font-size:12px;
+  box-shadow:0 4px 12px rgba(0,0,0,.4);z-index:20;max-width:320px;animation:slide .2s ease-out}
+.toast.ok{border-color:var(--green);color:var(--green)}
+.toast.err{border-color:var(--red);color:var(--red)}
+@keyframes slide{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand" id="brand">oximon</div>
+  <div class="stats">
+    <div class="kv"><span class="k">iface</span><span class="v" id="s-iface">-</span></div>
+    <div class="kv"><span class="k">total</span><span class="v" id="s-total">0</span></div>
+    <div class="kv"><span class="k">online</span><span class="v green" id="s-online">0</span></div>
+    <div class="kv"><span class="k">w/ ports</span><span class="v cyan" id="s-ports">0</span></div>
+    <div class="kv"><span class="k">w/ os</span><span class="v yellow" id="s-os">0</span></div>
+  </div>
+  <div class="progress" id="progress">
+    <div class="p-item">
+      <span class="p-k">arp</span>
+      <span style="display:flex;align-items:center;gap:6px"><span class="dot" id="p-arp-dot"></span><span class="p-v" id="p-arp">idle</span></span>
+    </div>
+    <div class="p-item">
+      <span class="p-k">intensive</span>
+      <span class="p-v zero" id="p-intensive">0</span>
+    </div>
+  </div>
+  <div class="actions" id="actions"></div>
+  <input id="search" placeholder="search ip / mac / vendor / hostname / os / port...">
+</header>
+<div class="progbar" id="progbar"><div class="bar"></div></div>
+
+<main><div id="cy"></div></main>
+
+<div class="legend">
+  <div class="row"><span class="dot gw"></span>gateway</div>
+  <div class="row"><span class="dot on"></span>online</div>
+  <div class="row"><span class="dot portful"></span>open ports</div>
+  <div class="row"><span class="dot off"></span>offline</div>
+</div>
+
+<div class="controls">
+  <button data-layout="concentric" class="active">concentric</button>
+  <button data-layout="cose">force</button>
+  <button data-layout="grid">grid</button>
+  <button data-layout="circle">circle</button>
+  <button id="fit">fit</button>
+</div>
+
+<aside><div id="sidebar"></div></aside>
+<footer id="foot">oximon network map</footer>
+
+<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<script>
+let PAYLOAD = __PAYLOAD__;
+const LIVE = PAYLOAD === null;
+let selectedMac = null;
+
+function el(tag, opts){
+  const e = document.createElement(tag);
+  if (!opts) return e;
+  if (opts.cls) e.className = opts.cls;
+  if (opts.id) e.id = opts.id;
+  if (opts.text != null) e.textContent = String(opts.text);
+  if (opts.title != null) e.title = String(opts.title);
+  if (opts.attrs) for (const k of Object.keys(opts.attrs)) e.setAttribute(k, opts.attrs[k]);
+  if (opts.on) for (const k of Object.keys(opts.on)) e.addEventListener(k, opts.on[k]);
+  if (opts.children) for (const c of opts.children) if (c) e.appendChild(c);
+  return e;
+}
+
+function fmtTs(s){ if(!s) return '-'; try { return new Date(s).toLocaleString(); } catch(e){ return s; } }
+function fmtShort(s){ if(!s) return ''; try { const d = new Date(s);
+  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'}); } catch(e){ return s; } }
+
+function toast(msg, kind){
+  const t = el('div', { cls: 'toast ' + (kind || ''), text: msg });
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+async function api(path, body){
+  const res = await fetch(path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: body !== undefined ? {'content-type': 'application/json'} : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j.error || j.message || res.statusText);
+  return j;
+}
+
+const cy = cytoscape({
+  container: document.getElementById('cy'),
+  elements: [],
+  wheelSensitivity: 0.25,
+  style: [
+    {
+      selector: 'node',
+      style: {
+        'label': 'data(label)',
+        'color': '#d7dde8',
+        'font-family': 'ui-monospace, monospace',
+        'font-size': 10,
+        'text-margin-y': -8,
+        'text-valign': 'bottom',
+        'text-halign': 'center',
+        'text-outline-width': 2,
+        'text-outline-color': '#070a0f',
+        'width': 28, 'height': 28,
+        'background-color': '#334155',
+        'border-width': 2,
+        'border-color': '#1e2533',
+        'transition-property': 'background-color, border-color, width, height',
+        'transition-duration': 200,
+      }
+    },
+    { selector: 'node[?connected]', style: { 'background-color': '#34d399', 'border-color': '#065f46' } },
+    { selector: 'node[!connected]', style: { 'background-color': '#334155', 'border-color': '#1e2533', 'opacity': 0.55 } },
+    { selector: 'node[open_ports > 0]', style: { 'border-color': '#22d3ee', 'border-width': 3 } },
+    { selector: 'node[?is_gateway]', style: { 'shape': 'round-rectangle', 'background-color': '#fbbf24',
+        'border-color': '#854d0e', 'width': 40, 'height': 40, 'font-size': 12 } },
+    { selector: 'node:selected', style: { 'border-color': '#60a5fa', 'border-width': 4 } },
+    { selector: 'node.dimmed', style: { 'opacity': 0.15 } },
+    { selector: 'node.match', style: { 'border-color': '#c084fc', 'border-width': 4 } },
+    {
+      selector: 'edge',
+      style: {
+        'curve-style': 'bezier',
+        'line-color': '#1e2533',
+        'width': 1,
+        'target-arrow-shape': 'none',
+        'opacity': 0.5,
+      }
+    },
+    { selector: 'edge.dimmed', style: { 'opacity': 0.1 } },
+  ],
+});
+
+function concentricLayout(){
+  return {
+    name: 'concentric',
+    concentric: n => n.data('is_gateway') ? 100 : (n.data('connected') ? 50 : 10),
+    levelWidth: () => 1,
+    minNodeSpacing: 30,
+    animate: true,
+    animationDuration: 400,
+  };
+}
+
+document.querySelectorAll('.controls button[data-layout]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.controls button[data-layout]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const name = btn.dataset.layout;
+    let opts = { name, animate: true, animationDuration: 400, fit: true, padding: 40 };
+    if (name === 'concentric') opts = concentricLayout();
+    if (name === 'cose') opts = { name: 'cose', animate: true, idealEdgeLength: 100, nodeRepulsion: 8000,
+      nodeOverlap: 10, gravity: 0.3, fit: true, padding: 50 };
+    cy.layout(opts).run();
+  });
+});
+document.getElementById('fit').addEventListener('click', () => cy.fit(null, 60));
+
+cy.on('tap', 'node', evt => { selectedMac = evt.target.data('mac'); renderSidebar(evt.target.data()); });
+cy.on('tap', e => { if (e.target === cy) { selectedMac = null; clearSidebar(); } });
+
+function applyPayload(payload){
+  if (!payload) return;
+  PAYLOAD = payload;
+  const m = payload.meta || {};
+  document.getElementById('s-iface').textContent = m.iface || '-';
+  document.getElementById('s-total').textContent = m.total || 0;
+  document.getElementById('s-online').textContent = m.connected || 0;
+  document.getElementById('s-ports').textContent = m.with_ports || 0;
+  document.getElementById('s-os').textContent = m.with_os || 0;
+  document.getElementById('foot').textContent =
+    'generated ' + fmtTs(m.generated_at) + (m.gateway_ip ? ' \u00b7 gateway ' + m.gateway_ip : '');
+
+  const prog = m.progress || {};
+  const arpOn = !!prog.arp_scanning;
+  const inflight = prog.intensive_inflight || 0;
+  const arpDot = document.getElementById('p-arp-dot');
+  const arpTxt = document.getElementById('p-arp');
+  arpDot.classList.toggle('on', arpOn);
+  arpTxt.textContent = arpOn ? 'scanning' : 'idle';
+  arpTxt.className = 'p-v' + (arpOn ? ' active' : ' zero');
+  const intTxt = document.getElementById('p-intensive');
+  intTxt.textContent = inflight;
+  intTxt.className = 'p-v' + (inflight > 0 ? ' active' : ' zero');
+  document.getElementById('progbar').classList.toggle('active', arpOn || inflight > 0);
+
+  const existing = new Set(cy.nodes().map(n => n.id()));
+  const incoming = new Set((payload.graph.nodes || []).map(n => n.data.id));
+  cy.nodes().filter(n => !incoming.has(n.id())).remove();
+  cy.edges().remove();
+
+  let didAdd = false;
+  for (const n of (payload.graph.nodes || [])) {
+    if (existing.has(n.data.id)) {
+      cy.getElementById(n.data.id).data(n.data);
+    } else {
+      cy.add({ group: 'nodes', data: n.data });
+      didAdd = true;
+    }
+  }
+  for (const e of (payload.graph.edges || [])) {
+    cy.add({ group: 'edges', data: e.data });
+  }
+
+  if (selectedMac) {
+    const node = cy.getElementById(selectedMac);
+    if (node.length) renderSidebar(node.data()); else clearSidebar();
+  }
+
+  if (didAdd) {
+    const active = document.querySelector('.controls button[data-layout].active');
+    const name = active ? active.dataset.layout : 'concentric';
+    let opts = { name, animate: false, fit: true, padding: 40 };
+    if (name === 'concentric') { opts = concentricLayout(); opts.animate = false; }
+    if (name === 'cose') opts = { name: 'cose', animate: false, idealEdgeLength: 100, nodeRepulsion: 8000,
+      nodeOverlap: 10, gravity: 0.3, fit: true, padding: 50 };
+    cy.layout(opts).run();
+  }
+}
+
+function clearSidebar(){
+  const sb = document.getElementById('sidebar');
+  sb.className = 'empty';
+  sb.replaceChildren(
+    el('div', { cls: 'ico', text: '\u29E1' }),
+    el('div', { text: 'click a node for detail' })
+  );
+}
+
+function kv(k, v, vcls){
+  return [
+    el('div', { cls: 'k', text: k }),
+    el('div', { cls: 'v' + (vcls ? ' ' + vcls : ''), text: v }),
+  ];
+}
+
+function renderSidebar(d){
+  const sb = document.getElementById('sidebar');
+  sb.className = '';
+  sb.replaceChildren();
+
+  const header = el('h2');
+  header.appendChild(document.createTextNode(d.label || d.ip));
+  header.appendChild(el('span', {
+    cls: 'badge ' + (d.connected ? 'on' : 'off'),
+    text: d.connected ? 'online' : 'offline'
+  }));
+  if (d.is_gateway) header.appendChild(el('span', { cls: 'badge gw', text: 'gateway' }));
+
+  const kvGrid = el('div', { cls: 'kv-grid', children: [
+    ...kv('ip', d.ip, 'mono'),
+    ...kv('mac', d.mac, 'mono'),
+    ...kv('hostname', d.hostname || 'unknown', d.hostname ? '' : 'dim'),
+    ...kv('os', d.os_guess || 'unknown', d.os_guess ? '' : 'dim'),
+    ...kv('rtt', d.rtt_ms != null ? d.rtt_ms.toFixed(1) + ' ms' : '-'),
+    ...kv('first seen', fmtTs(d.first_seen)),
+    ...kv('last seen', fmtTs(d.last_seen)),
+  ]});
+
+  const topCard = el('div', { cls: 'card', children: [
+    header,
+    el('div', { cls: 'sub', text: d.vendor || 'vendor unknown' }),
+    kvGrid,
+  ]});
+
+  if (LIVE) {
+    const fullCb = el('input', { attrs: { type: 'checkbox', id: 'full-ports-cb' } });
+    const actions = el('div', { cls: 'actions-row', children: [
+      el('button', { text: 'scan this', on: { click: async (e) => {
+        const btn = e.currentTarget; btn.disabled = true;
+        try {
+          const r = await api('/api/intensive', { mac: d.mac, full_ports: fullCb.checked });
+          toast('queued ' + (r.queued || 1) + (r.full_ports ? ' (all ports)' : ''), 'ok');
+        } catch (err) { toast(String(err), 'err'); }
+        finally { btn.disabled = false; }
+      }}}),
+      el('label', { children: [fullCb, document.createTextNode('full ports (65535)')] }),
+    ]});
+    topCard.appendChild(actions);
+  }
+
+  sb.appendChild(topCard);
+
+  const portsCard = el('div', { cls: 'card' });
+  portsCard.appendChild(el('div', { cls: 'section-title',
+    text: 'ports' + ((d.ports && d.ports.length) ? ' (' + d.ports.length + ')' : '') }));
+  if (d.ports && d.ports.length) {
+    const thead = el('thead');
+    const thr = el('tr');
+    ['port', 'state', 'service', 'banner'].forEach(h => thr.appendChild(el('th', { text: h })));
+    thead.appendChild(thr);
+    const tbody = el('tbody');
+    for (const p of d.ports) {
+      const tr = el('tr');
+      tr.appendChild(el('td', { cls: 'port', text: p.port + '/' + p.proto }));
+      tr.appendChild(el('td', { text: p.state }));
+      tr.appendChild(el('td', { cls: 'svc', text: p.service || '' }));
+      tr.appendChild(el('td', { cls: 'banner', text: p.banner || '', title: p.banner || '' }));
+      tbody.appendChild(tr);
+    }
+    portsCard.appendChild(el('table', { cls: 'ports', children: [thead, tbody] }));
+  } else {
+    portsCard.appendChild(el('div', { cls: 'empty', attrs: { style: 'padding:16px 0' }, text: 'no scan yet' }));
+  }
+  sb.appendChild(portsCard);
+
+  if (d.events && d.events.length) {
+    const evCard = el('div', { cls: 'card', children: [
+      el('div', { cls: 'section-title', text: 'events' }),
+    ]});
+    const evWrap = el('div', { cls: 'events' });
+    for (const ev of d.events.slice(0, 25)) {
+      evWrap.appendChild(el('div', { cls: 'ev', children: [
+        el('div', { cls: 'ts', text: fmtShort(ev.ts) }),
+        el('div', { cls: 'kind k-' + ev.kind, text: ev.kind }),
+        el('div', { cls: 'detail', text: ev.detail || '' }),
+      ]}));
+    }
+    evCard.appendChild(evWrap);
+    sb.appendChild(evCard);
+  }
+}
+
+function buildHeaderActions(){
+  const box = document.getElementById('actions');
+  if (!LIVE) return;
+  const scanAll = el('button', { text: 'intensive all', on: { click: async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    try { const r = await api('/api/intensive', { all: true }); toast('queued ' + (r.queued || 0) + ' intensive scan(s)', 'ok'); }
+    catch (err) { toast(String(err), 'err'); }
+    finally { btn.disabled = false; }
+  }}});
+  const rescan = el('button', { text: 'rescan', on: { click: async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    try { await api('/api/rescan', {}); toast('rescan queued', 'ok'); }
+    catch (err) { toast(String(err), 'err'); }
+    finally { btn.disabled = false; }
+  }}});
+  const mute = el('button', { text: 'mute', on: { click: async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    try {
+      const r = await api('/api/toggle_mute', {});
+      btn.textContent = r.notifications ? 'mute' : 'unmute';
+      btn.classList.toggle('muted', !r.notifications);
+      toast(r.notifications ? 'unmuted' : 'muted', 'ok');
+    } catch (err) { toast(String(err), 'err'); }
+    finally { btn.disabled = false; }
+  }}});
+  box.appendChild(scanAll);
+  box.appendChild(rescan);
+  box.appendChild(mute);
+}
+
+const search = document.getElementById('search');
+search.addEventListener('input', () => {
+  const q = search.value.trim().toLowerCase();
+  cy.nodes().removeClass('dimmed match');
+  cy.edges().removeClass('dimmed');
+  if (!q) return;
+  cy.nodes().forEach(n => {
+    const d = n.data();
+    const hay = [d.ip, d.mac, d.hostname, d.vendor, d.os_guess, d.label,
+                 ...(d.ports || []).flatMap(p => [p.port, p.service, p.banner])]
+      .filter(Boolean).join(' ').toLowerCase();
+    if (hay.includes(q)) n.addClass('match');
+    else n.addClass('dimmed');
+  });
+  cy.edges().addClass('dimmed');
+});
+
+function connectWs(){
+  const brand = document.getElementById('brand');
+  try {
+    const ws = new WebSocket('ws://' + location.host + '/ws');
+    ws.onopen = () => brand.classList.add('live');
+    ws.onmessage = (e) => { try { applyPayload(JSON.parse(e.data)); } catch(err) { console.error(err); } };
+    ws.onclose = () => {
+      brand.classList.remove('live'); brand.classList.add('disconnected');
+      setTimeout(connectWs, 3000);
+    };
+    ws.onerror = () => { try { ws.close(); } catch(_){} };
+  } catch (e) { console.error(e); setTimeout(connectWs, 3000); }
+}
+
+function init(){
+  buildHeaderActions();
+  clearSidebar();
+  if (LIVE) {
+    fetch('/api/state').then(r => r.json()).then(applyPayload).catch(err => toast(String(err), 'err'));
+    connectWs();
+  } else {
+    applyPayload(PAYLOAD);
+    const active = document.querySelector('.controls button[data-layout].active');
+    cy.layout(concentricLayout()).run();
+    cy.ready(() => cy.fit(null, 60));
+  }
+}
+init();
+</script>
+</body>
+</html>
