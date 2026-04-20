@@ -12,12 +12,13 @@ pub fn write_map(
     ports: &HashMap<String, Vec<Port>>,
     iface: &str,
     progress: Progress,
+    running: Vec<RunningView>,
 ) -> Result<()> {
     let gateway_ip = detect_gateway();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let html = render_inner(devices, events, ports, iface, gateway_ip.as_deref(), progress).1;
+    let html = render_inner(devices, events, ports, iface, gateway_ip.as_deref(), progress, running).1;
     let tmp = path.with_extension("html.tmp");
     std::fs::write(&tmp, html)?;
     std::fs::rename(&tmp, path)?;
@@ -48,6 +49,7 @@ struct NodeData<'a> {
     hostname: Option<&'a str>,
     vendor: Option<&'a str>,
     os_guess: Option<&'a str>,
+    os_kind: &'static str,
     rtt_ms: Option<f32>,
     first_seen: String,
     last_seen: String,
@@ -56,6 +58,40 @@ struct NodeData<'a> {
     open_ports: usize,
     ports: Vec<PortView>,
     events: Vec<EventView>,
+}
+
+pub fn classify_os(os_guess: Option<&str>, vendor: Option<&str>) -> &'static str {
+    let s = os_guess.unwrap_or("").to_lowercase();
+    let v = vendor.unwrap_or("").to_lowercase();
+    let hay = format!("{s} {v}");
+    if hay.contains("windows") {
+        "windows"
+    } else if hay.contains("mac")
+        || hay.contains("darwin")
+        || hay.contains("apple")
+        || hay.contains("ios")
+    {
+        "mac"
+    } else if hay.contains("android") {
+        "android"
+    } else if hay.contains("mikrotik")
+        || hay.contains("routeros")
+        || hay.contains("openwrt")
+        || hay.contains("cisco")
+        || hay.contains("routerboard")
+        || hay.contains("ubiquiti")
+        || hay.contains("asus")
+    {
+        "router"
+    } else if hay.contains("crestron") || hay.contains("printer") || hay.contains("iot") {
+        "iot"
+    } else if hay.contains("vmware") || hay.contains("virtualbox") || hay.contains("qemu") {
+        "vm"
+    } else if hay.contains("linux") || hay.contains("ubuntu") || hay.contains("debian") {
+        "linux"
+    } else {
+        "unknown"
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -119,6 +155,25 @@ pub struct Progress {
 struct Payload<'a> {
     meta: Meta<'a>,
     graph: Graph<'a>,
+    events: Vec<FlatEvent<'a>>,
+    running: Vec<RunningView>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct RunningView {
+    pub kind: String,
+    pub label: String,
+    pub started_at: String,
+}
+
+#[derive(Serialize)]
+struct FlatEvent<'a> {
+    ts: String,
+    mac: &'a str,
+    ip: Option<&'a str>,
+    label: Option<&'a str>,
+    kind: &'static str,
+    detail: Option<&'a str>,
 }
 
 pub fn build_payload_json(
@@ -128,15 +183,21 @@ pub fn build_payload_json(
     iface: &str,
     gateway_ip: Option<&str>,
     progress: Progress,
+    running: Vec<RunningView>,
 ) -> String {
-    render_inner(devices, events, ports, iface, gateway_ip, progress).0
+    render_inner(devices, events, ports, iface, gateway_ip, progress, running).0
 }
 
 pub fn template_empty() -> String {
     TEMPLATE.replace("__PAYLOAD__", "null")
 }
 
-pub fn build_snapshot(db: &crate::db::Db, iface: &str, progress: Progress) -> String {
+pub fn build_snapshot(
+    db: &crate::db::Db,
+    iface: &str,
+    progress: Progress,
+    running: Vec<RunningView>,
+) -> String {
     let gateway_ip = detect_gateway();
     let devices = db.all_devices().unwrap_or_default();
     let events = db.recent_events(200).unwrap_or_default();
@@ -153,6 +214,7 @@ pub fn build_snapshot(db: &crate::db::Db, iface: &str, progress: Progress) -> St
         iface,
         gateway_ip.as_deref(),
         progress,
+        running,
     )
 }
 
@@ -163,6 +225,7 @@ fn render_inner(
     iface: &str,
     gateway_ip: Option<&str>,
     progress: Progress,
+    running: Vec<RunningView>,
 ) -> (String, String) {
     let mut events_by_mac: HashMap<&str, Vec<EventView>> = HashMap::new();
     for e in events {
@@ -197,6 +260,7 @@ fn render_inner(
                 .collect();
             let is_gw = Some(d.ip.as_str()) == gateway_ip;
             let label = d.hostname.clone().unwrap_or_else(|| d.ip.clone());
+            let os_kind = classify_os(d.os_guess.as_deref(), d.vendor.as_deref());
             Node {
                 data: NodeData {
                     id: d.mac.as_str(),
@@ -206,6 +270,7 @@ fn render_inner(
                     hostname: d.hostname.as_deref(),
                     vendor: d.vendor.as_deref(),
                     os_guess: d.os_guess.as_deref(),
+                    os_kind,
                     rtt_ms: d.rtt_ms,
                     first_seen: d.first_seen.to_rfc3339(),
                     last_seen: d.last_seen.to_rfc3339(),
@@ -252,9 +317,31 @@ fn render_inner(
         progress,
     };
 
+    let flat_events: Vec<FlatEvent> = events
+        .iter()
+        .take(200)
+        .map(|e| {
+            let (ip, label) = devices
+                .iter()
+                .find(|d| d.mac.eq_ignore_ascii_case(&e.mac))
+                .map(|d| (Some(d.ip.as_str()), d.hostname.as_deref()))
+                .unwrap_or((None, None));
+            FlatEvent {
+                ts: e.ts.to_rfc3339(),
+                mac: e.mac.as_str(),
+                ip,
+                label,
+                kind: e.kind.as_str(),
+                detail: e.detail.as_deref(),
+            }
+        })
+        .collect();
+
     let payload = Payload {
         meta,
         graph: Graph { nodes, edges },
+        events: flat_events,
+        running,
     };
     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
 

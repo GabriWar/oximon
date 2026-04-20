@@ -175,6 +175,7 @@ async fn run_daemon(args: Cli) -> Result<()> {
     let notify_on = Arc::new(AtomicBool::new(cfg.notify));
     let arp_scanning = Arc::new(AtomicBool::new(false));
     let intensive_inflight = Arc::new(AtomicUsize::new(0));
+    let running: Arc<Mutex<Vec<oximon::html::RunningView>>> = Arc::new(Mutex::new(Vec::new()));
     let map_path = args
         .map_path
         .clone()
@@ -193,6 +194,7 @@ async fn run_daemon(args: Cli) -> Result<()> {
         let live_tx = live_tx.clone();
         let arp_flag = arp_scanning.clone();
         let inflight = intensive_inflight.clone();
+        let running_c = running.clone();
         tokio::spawn(async move {
             while map_rx.recv().await.is_some() {
                 while map_rx.try_recv().is_ok() {}
@@ -204,11 +206,12 @@ async fn run_daemon(args: Cli) -> Result<()> {
                     arp_scanning: arp_flag.load(Ordering::Relaxed),
                     intensive_inflight: inflight.load(Ordering::Relaxed),
                 };
+                let running_snap: Vec<oximon::html::RunningView> = running_c.lock().unwrap().clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    write_map_now(&db_c, &path, &iface, progress);
+                    write_map_now(&db_c, &path, &iface, progress, running_snap.clone());
                     let snap = {
                         let db = db_c.lock().unwrap();
-                        oximon::html::build_snapshot(&db, &iface, progress)
+                        oximon::html::build_snapshot(&db, &iface, progress, running_snap)
                     };
                     let _ = live_tx.send(snap);
                 })
@@ -227,6 +230,7 @@ async fn run_daemon(args: Cli) -> Result<()> {
         let sem = intensive_sem.clone();
         let map_tx = map_tx.clone();
         let inflight = intensive_inflight.clone();
+        let running_c = running.clone();
         tokio::spawn(async move {
             while let Some((mac, ip, full_ports)) = intensive_rx.recv().await {
                 let permit = match sem.clone().acquire_owned().await {
@@ -237,11 +241,25 @@ async fn run_daemon(args: Cli) -> Result<()> {
                 let notify_flag = notify_flag.clone();
                 let map_tx = map_tx.clone();
                 let inflight = inflight.clone();
+                let running = running_c.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let mac_c = mac.clone();
                     let ip_c = ip.clone();
                     let opts = intensive::Options { full_ports };
+                    {
+                        let mut r = running.lock().unwrap();
+                        r.push(oximon::html::RunningView {
+                            kind: "intensive".into(),
+                            label: format!(
+                                "nmap {}{}",
+                                ip,
+                                if full_ports { " (all 65535)" } else { "" }
+                            ),
+                            started_at: Utc::now().to_rfc3339(),
+                        });
+                    }
+                    let _ = map_tx.try_send(());
                     let res =
                         tokio::task::spawn_blocking(move || intensive::run_with(&mac_c, &ip_c, opts))
                             .await;
@@ -278,6 +296,10 @@ async fn run_daemon(args: Cli) -> Result<()> {
                         Err(e) => tracing::warn!(?e, mac=%mac, "intensive join err"),
                     }
                     inflight.fetch_sub(1, Ordering::Relaxed);
+                    {
+                        let mut r = running.lock().unwrap();
+                        r.retain(|op| !(op.kind == "intensive" && op.label.contains(&ip)));
+                    }
                     let _ = map_tx.try_send(());
                 });
             }
@@ -330,6 +352,7 @@ async fn run_daemon(args: Cli) -> Result<()> {
             arp_scanning: arp_scanning.clone(),
             intensive_inflight: intensive_inflight.clone(),
             map_tx: map_tx.clone(),
+            running: running.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = oximon::http::serve(addr, app_state).await {
@@ -353,7 +376,7 @@ async fn run_daemon(args: Cli) -> Result<()> {
                 run_scan_tick(
                     scanner.clone(), db.clone(), oui.clone(), notify_on.clone(),
                     &map_path, &iface_name, args.arp_passes, args.arp_window_ms,
-                    arp_scanning.clone(), map_tx.clone(),
+                    arp_scanning.clone(), map_tx.clone(), running.clone(),
                 ).await;
                 let _ = map_tx.try_send(());
                 update_tray(&tray_handle, &db, &iface_name, notify_on.load(Ordering::Relaxed));
@@ -364,7 +387,7 @@ async fn run_daemon(args: Cli) -> Result<()> {
                 run_scan_tick(
                     scanner.clone(), db.clone(), oui.clone(), notify_on.clone(),
                     &map_path, &iface_name, args.arp_passes, args.arp_window_ms,
-                    arp_scanning.clone(), map_tx.clone(),
+                    arp_scanning.clone(), map_tx.clone(), running.clone(),
                 ).await;
                 let _ = map_tx.try_send(());
                 update_tray(&tray_handle, &db, &iface_name, notify_on.load(Ordering::Relaxed));
@@ -436,6 +459,7 @@ fn write_map_now(
     path: &std::path::Path,
     iface: &str,
     progress: oximon::html::Progress,
+    running: Vec<oximon::html::RunningView>,
 ) {
     let devices = {
         let db = db.lock().unwrap();
@@ -454,7 +478,7 @@ fn write_map_now(
             }
         }
     }
-    if let Err(e) = oximon::html::write_map(path, &devices, &events, &ports_by_mac, iface, progress) {
+    if let Err(e) = oximon::html::write_map(path, &devices, &events, &ports_by_mac, iface, progress, running) {
         tracing::warn!(?e, "map write fail");
     } else {
         tracing::debug!(path = %path.display(), "map written");
@@ -614,11 +638,20 @@ async fn run_scan_tick(
     arp_window_ms: u64,
     arp_flag: Arc<AtomicBool>,
     map_tx: mpsc::Sender<()>,
+    running: Arc<Mutex<Vec<oximon::html::RunningView>>>,
 ) {
     tracing::info!("scan start");
     let _ = map_path;
     let _ = iface_name;
     arp_flag.store(true, Ordering::Relaxed);
+    {
+        let mut r = running.lock().unwrap();
+        r.push(oximon::html::RunningView {
+            kind: "arp".into(),
+            label: format!("arp sweep {}", scanner.iface_name()),
+            started_at: Utc::now().to_rfc3339(),
+        });
+    }
     let _ = map_tx.try_send(());
     let scan_ts = Utc::now();
     let events_result = tokio::task::spawn_blocking(move || -> Vec<(EventKind, Device)> {
@@ -767,6 +800,10 @@ async fn run_scan_tick(
         Err(e) => tracing::error!(?e, "spawn_blocking join err"),
     }
     arp_flag.store(false, Ordering::Relaxed);
+    {
+        let mut r = running.lock().unwrap();
+        r.retain(|op| op.kind != "arp");
+    }
     let _ = map_tx.try_send(());
     if notify_on.load(Ordering::Relaxed) {
         if let Ok(events) = events_result {

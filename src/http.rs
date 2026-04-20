@@ -25,6 +25,7 @@ pub struct AppState {
     pub arp_scanning: Arc<AtomicBool>,
     pub intensive_inflight: Arc<AtomicUsize>,
     pub map_tx: mpsc::Sender<()>,
+    pub running: Arc<Mutex<Vec<crate::html::RunningView>>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -32,6 +33,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(serve_ui))
         .route("/api/state", get(api_state))
         .route("/api/intensive", post(api_intensive))
+        .route("/api/scan_subnet", post(api_scan_subnet))
         .route("/api/mute", post(api_mute))
         .route("/api/unmute", post(api_unmute))
         .route("/api/toggle_mute", post(api_toggle_mute))
@@ -55,9 +57,10 @@ async fn serve_ui() -> Html<String> {
 }
 
 async fn api_state(State(state): State<AppState>) -> impl IntoResponse {
+    let running = state.running.lock().unwrap().clone();
     let json = {
         let db = state.db.lock().unwrap();
-        crate::html::build_snapshot(&db, &state.iface, progress_of(&state))
+        crate::html::build_snapshot(&db, &state.iface, progress_of(&state), running)
     };
     ([(axum::http::header::CONTENT_TYPE, "application/json")], json)
 }
@@ -159,6 +162,65 @@ async fn api_intensive(
     })))
 }
 
+#[derive(Deserialize)]
+struct SubnetReq {
+    cidr: String,
+    #[serde(default)]
+    full_ports: bool,
+}
+
+async fn api_scan_subnet(
+    State(state): State<AppState>,
+    Json(req): Json<SubnetReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (base, prefix) = match parse_cidr(&req.cidr) {
+        Ok(x) => x,
+        Err(e) => return Err((StatusCode::BAD_REQUEST, e)),
+    };
+    let targets: Vec<(String, String)> = {
+        let db = state.db.lock().unwrap();
+        db.all_devices()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|d| d.connected && ip_in_subnet(&d.ip, base, prefix))
+            .map(|d| (d.mac, d.ip))
+            .collect()
+    };
+    if targets.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no connected devices in {}", req.cidr),
+        ));
+    }
+    let n = targets.len();
+    for (mac, ip) in targets {
+        state.intensive_inflight.fetch_add(1, Ordering::Relaxed);
+        if state.intensive_tx.try_send((mac, ip, req.full_ports)).is_err() {
+            state.intensive_inflight.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    let _ = state.map_tx.try_send(());
+    Ok(Json(serde_json::json!({"ok": true, "queued": n, "cidr": req.cidr})))
+}
+
+fn parse_cidr(s: &str) -> Result<(u32, u8), String> {
+    let (ip_s, prefix_s) = s.split_once('/').ok_or_else(|| format!("bad cidr {s}"))?;
+    let ip: std::net::Ipv4Addr = ip_s.parse().map_err(|e| format!("bad ip: {e}"))?;
+    let prefix: u8 = prefix_s.parse().map_err(|e| format!("bad prefix: {e}"))?;
+    if prefix > 32 {
+        return Err("prefix > 32".into());
+    }
+    let base = u32::from(ip);
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    Ok((base & mask, prefix))
+}
+
+fn ip_in_subnet(ip_str: &str, base: u32, prefix: u8) -> bool {
+    let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else { return false };
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    (u32::from(ip) & mask) == base
+}
+
 async fn api_mute(State(state): State<AppState>) -> Json<serde_json::Value> {
     state.notify_on.store(false, Ordering::Relaxed);
     Json(serde_json::json!({"ok": true, "notifications": false}))
@@ -186,8 +248,9 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 async fn handle_ws(mut socket: WebSocket, state: AppState) {
     let mut rx = state.live_tx.subscribe();
     let init = {
+        let running = state.running.lock().unwrap().clone();
         let db = state.db.lock().unwrap();
-        crate::html::build_snapshot(&db, &state.iface, progress_of(&state))
+        crate::html::build_snapshot(&db, &state.iface, progress_of(&state), running)
     };
     if socket.send(Message::Text(init.into())).await.is_err() {
         return;
