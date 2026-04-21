@@ -148,7 +148,8 @@ impl ArpScanner {
     }
 }
 
-/// L3 ping sweep via `nmap -sn`. Returns alive IPs + MAC (when available via ARP cache).
+/// L3 host discovery via nmap -sn with wide probe combo. Catches hosts that drop ICMP
+/// by also TCP-SYN-probing common ports. Beats bare `-PE` by a lot on wifi / windows / iot.
 pub fn scan_icmp(cidr: &str, timeout_s: u64) -> Result<Vec<ScanHit>> {
     let out = std::process::Command::new("nmap")
         .args([
@@ -157,6 +158,12 @@ pub fn scan_icmp(cidr: &str, timeout_s: u64) -> Result<Vec<ScanHit>> {
             "-n",
             "-T4",
             "--disable-arp-ping",
+            "-PE",
+            "-PP",
+            "-PM",
+            "-PS21,22,23,25,53,80,110,135,139,143,443,445,465,587,993,995,1723,3306,3389,5432,5900,5985,8080,8443,62078",
+            "-PA80,443,3389",
+            "-PU53,67,123,161,500,5353",
             "--host-timeout",
             &format!("{timeout_s}s"),
             "-oX",
