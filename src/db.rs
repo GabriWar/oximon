@@ -139,6 +139,16 @@ impl Db {
         Ok(rows)
     }
 
+    pub fn prune_events(&self, keep_last_n: i64, max_age_days: i64) -> Result<usize> {
+        let n1 = self.conn.execute(
+            "DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY ts DESC LIMIT ?1)",
+            params![keep_last_n],
+        )?;
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(max_age_days)).to_rfc3339();
+        let n2 = self.conn.execute("DELETE FROM events WHERE ts < ?1", params![cutoff])?;
+        Ok(n1 + n2)
+    }
+
     pub fn insert_event(&self, mac: &str, kind: EventKind, ts: DateTime<Utc>, detail: Option<&str>) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO events (mac, kind, ts, detail) VALUES (?1, ?2, ?3, ?4)",

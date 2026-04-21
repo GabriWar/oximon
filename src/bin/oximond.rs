@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
             } else {
                 anyhow::bail!("specify --mac, --ip, or --all");
             };
-            client_cmd(IpcCmd::Intensive { target, full_ports: *full_ports }).await
+            client_cmd(IpcCmd::Intensive { target, full_ports: *full_ports, vuln_scripts: false }).await
         }
         Some(Command::Mute) => client_cmd(IpcCmd::Mute).await,
         Some(Command::Unmute) => client_cmd(IpcCmd::Unmute).await,
@@ -238,7 +238,7 @@ async fn run_daemon(args: Cli) -> Result<()> {
     }
 
     // intensive worker pool
-    let (intensive_tx, mut intensive_rx) = mpsc::channel::<(String, String, bool)>(1024);
+    let (intensive_tx, mut intensive_rx) = mpsc::channel::<intensive::Job>(1024);
     let intensive_sem = Arc::new(Semaphore::new(args.intensive_workers.max(1)));
     {
         let db = db.clone();
@@ -248,7 +248,7 @@ async fn run_daemon(args: Cli) -> Result<()> {
         let inflight = intensive_inflight.clone();
         let running_c = running.clone();
         tokio::spawn(async move {
-            while let Some((mac, ip, full_ports)) = intensive_rx.recv().await {
+            while let Some(intensive::Job { mac, ip, full_ports, vuln_scripts }) = intensive_rx.recv().await {
                 let permit = match sem.clone().acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => break,
@@ -262,7 +262,7 @@ async fn run_daemon(args: Cli) -> Result<()> {
                     let _permit = permit;
                     let mac_c = mac.clone();
                     let ip_c = ip.clone();
-                    let opts = intensive::Options { full_ports };
+                    let opts = intensive::Options { full_ports, vuln_scripts };
                     {
                         let mut r = running.lock().unwrap();
                         r.push(oximon::html::RunningView {
@@ -283,8 +283,27 @@ async fn run_daemon(args: Cli) -> Result<()> {
                         Ok(Ok(r)) => {
                             let now = Utc::now();
                             let os = r.os_guess.clone();
+                            let mut new_port_details: Vec<String> = Vec::new();
                             {
                                 let mut db = db_c.lock().unwrap();
+                                // diff: find newly-open ports not previously known
+                                let prev: std::collections::HashSet<(u16, String)> = db
+                                    .ports_for(&mac)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter(|p| p.state == "open")
+                                    .map(|p| (p.port, p.proto))
+                                    .collect();
+                                for p in &r.ports {
+                                    if p.state == "open" && !prev.contains(&(p.port, p.proto.clone())) {
+                                        new_port_details.push(format!(
+                                            "{}/{} {}",
+                                            p.port,
+                                            p.proto,
+                                            p.service.as_deref().unwrap_or("")
+                                        ));
+                                    }
+                                }
                                 if let Err(e) = db.replace_ports(&mac, &r.ports) {
                                     tracing::warn!(?e, "replace_ports fail");
                                 }
@@ -295,6 +314,29 @@ async fn run_daemon(args: Cli) -> Result<()> {
                                     db.insert_event(&mac, EventKind::IntensiveDone, now, None)
                                 {
                                     tracing::warn!(?e, "insert_event fail");
+                                }
+                                // only emit NewPort events if this isn't the first scan (prev had data)
+                                if !prev.is_empty() {
+                                    for d in &new_port_details {
+                                        let _ =
+                                            db.insert_event(&mac, EventKind::NewPort, now, Some(d));
+                                    }
+                                }
+                            }
+                            if !new_port_details.is_empty() && notify_flag.load(Ordering::Relaxed) {
+                                if let Some(dev) = {
+                                    let db = db_c.lock().unwrap();
+                                    db.get_device(&mac).ok().flatten()
+                                } {
+                                    for d in &new_port_details {
+                                        let mut dev2 = dev.clone();
+                                        dev2.hostname = Some(format!(
+                                            "{} · {}",
+                                            dev.hostname.as_deref().unwrap_or(""),
+                                            d
+                                        ));
+                                        notify::emit_detached(EventKind::NewPort, dev2);
+                                    }
                                 }
                             }
                             if notify_flag.load(Ordering::Relaxed) {
@@ -436,7 +478,8 @@ async fn run_daemon(args: Cli) -> Result<()> {
                         tracing::info!(n = all_connected.len(), "tray: scan all");
                         for (mac, ip) in all_connected {
                             intensive_inflight.fetch_add(1, Ordering::Relaxed);
-                            if intensive_tx.try_send((mac, ip, false)).is_err() {
+                            let job = intensive::Job { mac, ip, full_ports: false, vuln_scripts: false };
+                            if intensive_tx.try_send(job).is_err() {
                                 intensive_inflight.fetch_sub(1, Ordering::Relaxed);
                             }
                         }
@@ -547,7 +590,7 @@ fn update_tray(
 async fn handle_ipc(
     cmd: IpcCmd,
     db: &Arc<Mutex<Db>>,
-    intensive_tx: &mpsc::Sender<(String, String, bool)>,
+    intensive_tx: &mpsc::Sender<intensive::Job>,
     notify_on: &Arc<AtomicBool>,
     rescan_tx: &mpsc::Sender<()>,
     iface: &str,
@@ -555,7 +598,7 @@ async fn handle_ipc(
     map_tx: &mpsc::Sender<()>,
 ) -> Reply {
     match cmd {
-        IpcCmd::Intensive { target, full_ports } => {
+        IpcCmd::Intensive { target, full_ports, vuln_scripts } => {
             if full_ports && matches!(target, Target::All) {
                 return Reply::err("--full-ports cannot combine with --all");
             }
@@ -586,7 +629,8 @@ async fn handle_ipc(
             let n = targets.len();
             for (mac, ip) in targets {
                 intensive_inflight.fetch_add(1, Ordering::Relaxed);
-                if intensive_tx.try_send((mac, ip, full_ports)).is_err() {
+                let job = intensive::Job { mac, ip, full_ports, vuln_scripts };
+                if intensive_tx.try_send(job).is_err() {
                     intensive_inflight.fetch_sub(1, Ordering::Relaxed);
                 }
             }
@@ -823,6 +867,17 @@ async fn run_scan_tick(
         }
 
         tracing::info!(hits = hits.len(), "scan tick");
+
+        // prune event log
+        {
+            let db_l = db.lock().unwrap();
+            if let Ok(n) = db_l.prune_events(10_000, 30) {
+                if n > 0 {
+                    tracing::debug!(pruned = n, "events pruned");
+                }
+            }
+        }
+
         new_events
     })
     .await;

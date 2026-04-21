@@ -17,7 +17,7 @@ use crate::db::Db;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Db>>,
-    pub intensive_tx: mpsc::Sender<(String, String, bool)>,
+    pub intensive_tx: mpsc::Sender<crate::intensive::Job>,
     pub rescan_tx: mpsc::Sender<()>,
     pub notify_on: Arc<AtomicBool>,
     pub iface: String,
@@ -111,6 +111,8 @@ struct IntensiveReq {
     all: bool,
     #[serde(default)]
     full_ports: bool,
+    #[serde(default)]
+    vuln_scripts: bool,
 }
 
 async fn api_intensive(
@@ -151,7 +153,13 @@ async fn api_intensive(
     let n = targets.len();
     for (mac, ip) in targets {
         state.intensive_inflight.fetch_add(1, Ordering::Relaxed);
-        if state.intensive_tx.try_send((mac, ip, req.full_ports)).is_err() {
+        let job = crate::intensive::Job {
+            mac,
+            ip,
+            full_ports: req.full_ports,
+            vuln_scripts: req.vuln_scripts,
+        };
+        if state.intensive_tx.try_send(job).is_err() {
             state.intensive_inflight.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -160,6 +168,7 @@ async fn api_intensive(
         "ok": true,
         "queued": n,
         "full_ports": req.full_ports,
+        "vuln_scripts": req.vuln_scripts,
     })))
 }
 
@@ -196,7 +205,13 @@ async fn api_scan_subnet(
     let n = targets.len();
     for (mac, ip) in targets {
         state.intensive_inflight.fetch_add(1, Ordering::Relaxed);
-        if state.intensive_tx.try_send((mac, ip, req.full_ports)).is_err() {
+        let job = crate::intensive::Job {
+            mac,
+            ip,
+            full_ports: req.full_ports,
+            vuln_scripts: false,
+        };
+        if state.intensive_tx.try_send(job).is_err() {
             state.intensive_inflight.fetch_sub(1, Ordering::Relaxed);
         }
     }

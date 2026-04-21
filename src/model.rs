@@ -23,6 +23,7 @@ pub enum EventKind {
     IpChange,
     HostnameChange,
     IntensiveDone,
+    NewPort,
 }
 
 impl EventKind {
@@ -33,6 +34,7 @@ impl EventKind {
             EventKind::IpChange => "ip_change",
             EventKind::HostnameChange => "hostname_change",
             EventKind::IntensiveDone => "intensive_done",
+            EventKind::NewPort => "new_port",
         }
     }
 
@@ -43,6 +45,7 @@ impl EventKind {
             "ip_change" => EventKind::IpChange,
             "hostname_change" => EventKind::HostnameChange,
             "intensive_done" => EventKind::IntensiveDone,
+            "new_port" => EventKind::NewPort,
             _ => return None,
         })
     }

@@ -149,6 +149,8 @@ fn run<B: ratatui::backend::Backend>(term: &mut Terminal<B>, refresh_ms: u64) ->
                         if let Some(mac) = ui.selected_mac() {
                             let msg = rt.block_on(send_ipc(IpcCmd::Intensive {
                                 target: Target::Mac { mac },
+                                full_ports: false,
+                                vuln_scripts: false,
                             }));
                             ui.set_flash(msg);
                         }
@@ -156,6 +158,8 @@ fn run<B: ratatui::backend::Backend>(term: &mut Terminal<B>, refresh_ms: u64) ->
                     KeyCode::Char('a') => {
                         let msg = rt.block_on(send_ipc(IpcCmd::Intensive {
                             target: Target::All,
+                            full_ports: false,
+                            vuln_scripts: false,
                         }));
                         ui.set_flash(msg);
                     }

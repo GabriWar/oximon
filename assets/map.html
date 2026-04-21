@@ -163,6 +163,7 @@ aside::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
 #log .events .k-disconnect{color:var(--red)}
 #log .events .k-intensive_done{color:var(--cyan)}
 #log .events .k-ip_change, #log .events .k-hostname_change{color:var(--yellow)}
+#log .events .k-new_port{color:var(--purple);font-weight:700}
 #log .events .kind{font-weight:600;font-size:10px;text-transform:uppercase}
 #log .ts{color:var(--muted);font-size:10px}
 #log .detail{color:var(--muted);word-break:break-all}
@@ -652,16 +653,18 @@ function renderSidebar(d){
 
   if (LIVE) {
     const fullCb = el('input', { attrs: { type: 'checkbox' } });
+    const vulnCb = el('input', { attrs: { type: 'checkbox' } });
     topCard.appendChild(el('div', { cls: 'actions-row', children: [
       el('button', { text: 'intensive scan', on: { click: async (e) => {
         const btn = e.currentTarget; btn.disabled = true;
         try {
-          const r = await api('/api/intensive', { mac: d.mac, full_ports: fullCb.checked });
-          toast('queued ' + (r.queued || 1) + (r.full_ports ? ' (all ports)' : ''), 'ok');
+          const r = await api('/api/intensive', { mac: d.mac, full_ports: fullCb.checked, vuln_scripts: vulnCb.checked });
+          toast('queued ' + (r.queued || 1) + (r.full_ports ? ' +all-ports' : '') + (r.vuln_scripts ? ' +vuln' : ''), 'ok');
         } catch (err) { toast(String(err), 'err'); }
         finally { btn.disabled = false; }
       }}}),
       el('label', { children: [fullCb, document.createTextNode('all 65535 ports')] }),
+      el('label', { children: [vulnCb, document.createTextNode('vuln scripts (NSE)')] }),
       el('button', { text: d.alias ? 'rename' : 'set alias', on: { click: async () => {
         const name = prompt('alias for ' + (d.hostname || d.ip) + ' (blank to clear):', d.alias || '');
         if (name === null) return;
@@ -701,14 +704,20 @@ function renderSidebar(d){
 }
 
 function renderLog(payload){
+  if (!payload) return;
   const runningBox = document.getElementById('log-running');
   const eventsBox = document.getElementById('log-events');
   runningBox.replaceChildren();
   eventsBox.replaceChildren();
 
+  const q = currentQuery;
   const running = payload.running || [];
-  const events = payload.events || [];
-  document.getElementById('log-counts').textContent = 'running ' + running.length + ' · events ' + events.length;
+  const events = (payload.events || []).filter(e => {
+    if (!q) return true;
+    const hay = [e.kind, e.ts, e.mac, e.ip, e.label, e.detail].filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(q);
+  });
+  document.getElementById('log-counts').textContent = 'running ' + running.length + ' · events ' + events.length + (q ? ' (filtered)' : '');
 
   if (running.length === 0) {
     runningBox.appendChild(el('div', { cls: 'empty', attrs: { style: 'padding:12px 0' }, text: 'no running tasks' }));
@@ -767,18 +776,27 @@ function buildHeaderActions(){
 }
 
 const search = document.getElementById('search');
+let currentQuery = '';
 search.addEventListener('input', () => {
-  const q = search.value.trim().toLowerCase();
-  cy.nodes().removeClass('match');
-  if (!q) { applyFilters(); return; }
-  cy.nodes().forEach(n => {
-    const d = n.data();
-    const hay = [d.ip, d.mac, d.hostname, d.vendor, d.os_guess, d.label,
-                 ...(d.ports || []).flatMap(p => [p.port, p.service, p.banner])]
-      .filter(Boolean).join(' ').toLowerCase();
-    if (hay.includes(q)) n.addClass('match');
-  });
+  currentQuery = search.value.trim().toLowerCase();
+  applySearch();
 });
+
+function nodeHay(d){
+  const evHay = (d.events || []).slice(0, 15).flatMap(e => [e.kind, e.detail]).filter(Boolean).join(' ');
+  return [d.ip, d.mac, d.alias, d.hostname, d.vendor, d.os_guess, d.os_kind, d.label,
+          ...(d.ports || []).flatMap(p => [p.port, p.proto, p.service, p.banner]),
+          evHay].filter(Boolean).join(' ').toLowerCase();
+}
+
+function applySearch(){
+  const q = currentQuery;
+  cy.nodes().removeClass('match');
+  if (!q) { renderLog(PAYLOAD); return; }
+  cy.nodes().forEach(n => { if (nodeHay(n.data()).includes(q)) n.addClass('match'); });
+  // also filter log drawer
+  if (PAYLOAD) renderLog(PAYLOAD);
+}
 
 // log toggle
 document.getElementById('log-toggle').addEventListener('click', () => {

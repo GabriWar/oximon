@@ -51,5 +51,9 @@ fn format_msg(kind: EventKind, d: &Device) -> (String, String) {
                 d.os_guess.as_deref().unwrap_or("unknown")
             ),
         ),
+        EventKind::NewPort => (
+            format!("new port on {}", d.ip),
+            format!("{} ({})", host, vendor),
+        ),
     }
 }

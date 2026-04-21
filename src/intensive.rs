@@ -14,6 +14,15 @@ pub struct IntensiveResult {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
     pub full_ports: bool,
+    pub vuln_scripts: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub mac: String,
+    pub ip: String,
+    pub full_ports: bool,
+    pub vuln_scripts: bool,
 }
 
 pub fn run(mac: &str, ip: &str) -> Result<IntensiveResult> {
@@ -35,6 +44,9 @@ pub fn run_with(mac: &str, ip: &str, opts: Options) -> Result<IntensiveResult> {
         args.push("-p-");
     } else {
         args.extend_from_slice(&["--top-ports", "1000"]);
+    }
+    if opts.vuln_scripts {
+        args.extend_from_slice(&["--script", "default,vuln"]);
     }
     args.extend_from_slice(&["-oX", "-", ip]);
 

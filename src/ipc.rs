@@ -11,6 +11,8 @@ pub enum Cmd {
         target: Target,
         #[serde(default)]
         full_ports: bool,
+        #[serde(default)]
+        vuln_scripts: bool,
     },
     Mute,
     Unmute,
