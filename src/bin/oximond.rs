@@ -57,8 +57,8 @@ struct Cli {
     /// scan mode: auto (arp + icmp fallback), arp (only), icmp (L3 only)
     #[arg(long, default_value = "auto")]
     scan_mode: String,
-    /// nmap -sn timeout seconds for icmp fallback
-    #[arg(long, default_value_t = 90)]
+    /// nmap -sn per-host timeout for icmp fallback
+    #[arg(long, default_value_t = 15)]
     icmp_timeout_s: u64,
 }
 
@@ -523,6 +523,18 @@ async fn run_daemon(args: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Merge hits by IP. First writer wins on MAC (ARP trusted before ICMP/nmap).
+/// Also try to replace any placeholder/bogus MACs from /proc/net/arp.
+fn merge_hits(dst: &mut Vec<oximon::model::ScanHit>, src: Vec<oximon::model::ScanHit>) {
+    let seen_ips: std::collections::HashSet<String> =
+        dst.iter().map(|x| x.ip.clone()).collect();
+    for hit in src {
+        if !seen_ips.contains(&hit.ip) {
+            dst.push(hit);
+        }
+    }
+}
+
 fn write_map_now(
     db: &Arc<Mutex<Db>>,
     path: &std::path::Path,
@@ -743,6 +755,8 @@ async fn run_scan_tick(
     let scan_ts = Utc::now();
     let events_result = tokio::task::spawn_blocking(move || -> Vec<(EventKind, Device)> {
         let cidr = scanner.subnet_cidr().to_string();
+        let iface_for_net = scanner.iface_name().to_string();
+        let network_label = oximon::scan::detect_network(&iface_for_net);
         let mut hits: Vec<oximon::model::ScanHit> = Vec::new();
         let do_arp = matches!(scan_mode.as_str(), "auto" | "arp");
         let force_icmp = scan_mode == "icmp";
@@ -756,19 +770,21 @@ async fn run_scan_tick(
                 Err(e) => tracing::error!(?e, "arp scan err"),
             }
         }
-        if (hits.is_empty() && scan_mode == "auto") || force_icmp {
-            tracing::info!(cidr = %cidr, "icmp fallback");
+        // auto = union of ARP + ICMP (not fallback-only)
+        // dedup by IP (ARP trusted first; ICMP/nmap macs can be bogus on wifi)
+        if scan_mode == "auto" || force_icmp {
+            let iface = scanner.iface_name().to_string();
+            if let Ok(h) = oximon::scan::scan_broadcast_icmp(&iface, 2) {
+                let before = hits.len();
+                merge_hits(&mut hits, h);
+                tracing::info!(added = hits.len() - before, "broadcast icmp done");
+            }
+
+            tracing::info!(cidr = %cidr, arp_hits = hits.len(), "icmp sweep");
             match oximon::scan::scan_icmp(&cidr, icmp_timeout_s) {
                 Ok(h) => {
                     tracing::info!(hits = h.len(), "icmp scan done");
-                    // merge (dedup by mac)
-                    let seen: std::collections::HashSet<String> =
-                        hits.iter().map(|x| x.mac.to_lowercase()).collect();
-                    for hit in h {
-                        if !seen.contains(&hit.mac.to_lowercase()) {
-                            hits.push(hit);
-                        }
-                    }
+                    merge_hits(&mut hits, h);
                 }
                 Err(e) => tracing::warn!(?e, "icmp scan err"),
             }
@@ -845,12 +861,16 @@ async fn run_scan_tick(
                 last_intensive,
                 os_guess: existing.as_ref().and_then(|d| d.os_guess.clone()),
                 alias: existing.as_ref().and_then(|d| d.alias.clone()),
+                last_network: Some(network_label.clone()),
             };
 
             {
                 let db = db.lock().unwrap();
                 if let Err(e) = db.upsert_device(&device) {
                     tracing::warn!(?e, mac=%mac, "upsert fail");
+                }
+                if let Err(e) = db.record_network(&mac, &network_label, scan_ts) {
+                    tracing::warn!(?e, mac=%mac, "record_network fail");
                 }
             }
 

@@ -18,7 +18,8 @@ pub fn write_map(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let html = render_inner(devices, events, ports, iface, gateway_ip.as_deref(), progress, running).1;
+    let empty_nets: HashMap<String, Vec<(String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, i64)>> = HashMap::new();
+    let html = render_inner(devices, events, ports, &empty_nets, iface, gateway_ip.as_deref(), progress, running).1;
     let tmp = path.with_extension("html.tmp");
     std::fs::write(&tmp, html)?;
     std::fs::rename(&tmp, path)?;
@@ -47,6 +48,8 @@ struct NodeData<'a> {
     ip: &'a str,
     mac: &'a str,
     alias: Option<&'a str>,
+    last_network: Option<&'a str>,
+    networks: Vec<NetView>,
     hostname: Option<&'a str>,
     vendor: Option<&'a str>,
     os_guess: Option<&'a str>,
@@ -93,6 +96,14 @@ pub fn classify_os(os_guess: Option<&str>, vendor: Option<&str>) -> &'static str
     } else {
         "unknown"
     }
+}
+
+#[derive(Serialize, Clone)]
+struct NetView {
+    network: String,
+    first_seen: String,
+    last_seen: String,
+    count: i64,
 }
 
 #[derive(Serialize, Clone)]
@@ -181,12 +192,13 @@ pub fn build_payload_json(
     devices: &[Device],
     events: &[Event],
     ports: &HashMap<String, Vec<Port>>,
+    networks: &HashMap<String, Vec<(String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, i64)>>,
     iface: &str,
     gateway_ip: Option<&str>,
     progress: Progress,
     running: Vec<RunningView>,
 ) -> String {
-    render_inner(devices, events, ports, iface, gateway_ip, progress, running).0
+    render_inner(devices, events, ports, networks, iface, gateway_ip, progress, running).0
 }
 
 pub fn template_empty() -> String {
@@ -203,15 +215,22 @@ pub fn build_snapshot(
     let devices = db.all_devices().unwrap_or_default();
     let events = db.recent_events(200).unwrap_or_default();
     let mut ports_by_mac: HashMap<String, Vec<Port>> = HashMap::new();
+    let mut networks_by_mac: HashMap<String, Vec<(String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, i64)>> = HashMap::new();
     for d in &devices {
         if let Ok(p) = db.ports_for(&d.mac) {
             ports_by_mac.insert(d.mac.clone(), p);
+        }
+        if let Ok(n) = db.networks_for(&d.mac) {
+            if !n.is_empty() {
+                networks_by_mac.insert(d.mac.clone(), n);
+            }
         }
     }
     build_payload_json(
         &devices,
         &events,
         &ports_by_mac,
+        &networks_by_mac,
         iface,
         gateway_ip.as_deref(),
         progress,
@@ -223,6 +242,7 @@ fn render_inner(
     devices: &[Device],
     events: &[Event],
     ports: &HashMap<String, Vec<Port>>,
+    networks: &HashMap<String, Vec<(String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, i64)>>,
     iface: &str,
     gateway_ip: Option<&str>,
     progress: Progress,
@@ -266,6 +286,19 @@ fn render_inner(
                 .or_else(|| d.hostname.clone())
                 .unwrap_or_else(|| d.ip.clone());
             let os_kind = classify_os(d.os_guess.as_deref(), d.vendor.as_deref());
+            let net_list: Vec<NetView> = networks
+                .get(&d.mac)
+                .map(|v| {
+                    v.iter()
+                        .map(|(n, fs, ls, c)| NetView {
+                            network: n.clone(),
+                            first_seen: fs.to_rfc3339(),
+                            last_seen: ls.to_rfc3339(),
+                            count: *c,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             Node {
                 data: NodeData {
                     id: d.mac.as_str(),
@@ -273,6 +306,8 @@ fn render_inner(
                     ip: d.ip.as_str(),
                     mac: d.mac.as_str(),
                     alias: d.alias.as_deref(),
+                    last_network: d.last_network.as_deref(),
+                    networks: net_list,
                     hostname: d.hostname.as_deref(),
                     vendor: d.vendor.as_deref(),
                     os_guess: d.os_guess.as_deref(),

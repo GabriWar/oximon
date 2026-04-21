@@ -157,13 +157,17 @@ pub fn scan_icmp(cidr: &str, timeout_s: u64) -> Result<Vec<ScanHit>> {
             "-sn",
             "-n",
             "-T4",
+            "--min-rate",
+            "800",
+            "--min-hostgroup",
+            "256",
+            "--max-retries",
+            "1",
             "--disable-arp-ping",
             "-PE",
             "-PP",
-            "-PM",
-            "-PS21,22,23,25,53,80,110,135,139,143,443,445,465,587,993,995,1723,3306,3389,5432,5900,5985,8080,8443,62078",
-            "-PA80,443,3389",
-            "-PU53,67,123,161,500,5353",
+            "-PS22,80,443,445,3389,8080,62078",
+            "-PA80,443",
             "--host-timeout",
             &format!("{timeout_s}s"),
             "-oX",
@@ -232,12 +236,15 @@ fn parse_nmap_hosts(xml: &str) -> Result<Vec<ScanHit>> {
                 if std::str::from_utf8(name.as_ref()).unwrap_or("") == "host" {
                     if cur_up {
                         if let Some(ip) = cur_ip.take() {
-                            let mac = cur_mac.take().unwrap_or_else(|| {
-                                read_arp_mac(&ip).unwrap_or_else(|| "00:00:00:00:00:00".into())
-                            });
+                            // nmap's MAC is unreliable on wifi (proxy-arp / driver quirks).
+                            // prefer kernel ARP cache; fallback to nmap; else placeholder.
+                            let mac = read_arp_mac(&ip)
+                                .or_else(|| cur_mac.take())
+                                .unwrap_or_else(|| "00:00:00:00:00:00".into());
                             hits.push(ScanHit { ip, mac, rtt_ms: None });
                         }
                     }
+                    cur_mac = None;
                 }
             }
             Ok(XmlEvent::Eof) => break,
@@ -248,6 +255,54 @@ fn parse_nmap_hosts(xml: &str) -> Result<Vec<ScanHit>> {
             _ => {}
         }
         buf.clear();
+    }
+    Ok(hits)
+}
+
+/// Broadcast ICMP echo to 224.0.0.1 (all-hosts multicast). Every multicast-capable
+/// host MUST respond per RFC 1122. Catches devices that drop unicast ICMP.
+/// Runs `ping -c 3 -W <t> -I <iface> 224.0.0.1` and parses responders.
+pub fn scan_broadcast_icmp(iface_name: &str, wait_s: u64) -> Result<Vec<ScanHit>> {
+    let out = std::process::Command::new("ping")
+        .args([
+            "-c",
+            "4",
+            "-W",
+            &format!("{wait_s}"),
+            "-I",
+            iface_name,
+            "-n",
+            "224.0.0.1",
+        ])
+        .output()
+        .context("ping multicast exec")?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // lines: "64 bytes from 192.168.15.1: icmp_seq=1 ttl=64 time=3.46 ms"
+    for line in stdout.lines() {
+        if let Some(rest) = line.split("bytes from ").nth(1) {
+            if let Some(ip) = rest.split(':').next() {
+                let ip = ip.trim();
+                if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                    seen.insert(ip.to_string());
+                }
+            }
+        }
+    }
+
+    let mut hits = Vec::new();
+    let arp = std::fs::read_to_string("/proc/net/arp").unwrap_or_default();
+    for ip in seen {
+        let mut mac = "00:00:00:00:00:00".to_string();
+        for line in arp.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 && parts[0] == ip && parts[5] == iface_name && parts[3] != "00:00:00:00:00:00" {
+                mac = parts[3].to_lowercase();
+                break;
+            }
+        }
+        hits.push(ScanHit { ip, mac, rtt_ms: None });
     }
     Ok(hits)
 }
@@ -264,6 +319,34 @@ fn read_arp_mac(ip: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Current network label for an iface. For wifi: SSID (+ BSSID). For wired: "wired:<iface>".
+pub fn detect_network(iface: &str) -> String {
+    let out = std::process::Command::new("iw")
+        .args(["dev", iface, "link"])
+        .output();
+    if let Ok(o) = out {
+        let s = String::from_utf8_lossy(&o.stdout);
+        let mut ssid: Option<String> = None;
+        let mut bssid: Option<String> = None;
+        for line in s.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("SSID:") {
+                ssid = Some(rest.trim().to_string());
+            }
+            if let Some(rest) = t.strip_prefix("Connected to ") {
+                bssid = rest.split_whitespace().next().map(|x| x.to_lowercase());
+            }
+        }
+        if let Some(s) = ssid.filter(|s| !s.is_empty()) {
+            return match bssid {
+                Some(b) => format!("{s} [{b}]"),
+                None => s,
+            };
+        }
+    }
+    format!("wired:{iface}")
 }
 
 pub fn reverse_dns(ip: &str) -> Option<String> {

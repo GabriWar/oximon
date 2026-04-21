@@ -14,6 +14,7 @@ pub struct Device {
     pub last_intensive: Option<DateTime<Utc>>,
     pub os_guess: Option<String>,
     pub alias: Option<String>,
+    pub last_network: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

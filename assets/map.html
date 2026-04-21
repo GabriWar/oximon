@@ -640,6 +640,7 @@ function renderSidebar(d){
     ...kv('hostname', d.hostname || 'unknown', d.hostname ? '' : 'dim'),
     ...kv('os', d.os_guess || 'unknown', d.os_guess ? '' : 'dim'),
     ...kv('os kind', OS_LABELS[d.os_kind] || 'unknown'),
+    ...kv('network', d.last_network || 'unknown', d.last_network ? '' : 'dim'),
     ...kv('rtt', d.rtt_ms != null ? d.rtt_ms.toFixed(1) + ' ms' : '-'),
     ...kv('first seen', fmtTs(d.first_seen)),
     ...kv('last seen', fmtTs(d.last_seen)),
@@ -701,6 +702,20 @@ function renderSidebar(d){
     portsCard.appendChild(el('div', { cls: 'empty', attrs: { style: 'padding:16px 0' }, text: 'no scan yet' }));
   }
   sb.appendChild(portsCard);
+
+  if (d.networks && d.networks.length) {
+    const netCard = el('div', { cls: 'card' });
+    netCard.appendChild(el('div', { cls: 'section-title', text: 'networks (' + d.networks.length + ')' }));
+    for (const n of d.networks) {
+      const row = el('div', { cls: 'ev', children: [
+        el('div', { cls: 'ts', text: 'x' + n.count }),
+        el('div', { cls: 'kind', attrs: { style: 'color:var(--cyan);font-weight:600;text-transform:none;letter-spacing:0' }, text: n.network }),
+        el('div', { cls: 'detail', text: 'first ' + fmtShort(n.first_seen) + ' · last ' + fmtShort(n.last_seen) }),
+      ]});
+      netCard.appendChild(row);
+    }
+    sb.appendChild(netCard);
+  }
 }
 
 function renderLog(payload){
