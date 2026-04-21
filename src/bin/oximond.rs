@@ -523,16 +523,119 @@ async fn run_daemon(args: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Merge hits by IP. First writer wins on MAC (ARP trusted before ICMP/nmap).
-/// Also try to replace any placeholder/bogus MACs from /proc/net/arp.
-fn merge_hits(dst: &mut Vec<oximon::model::ScanHit>, src: Vec<oximon::model::ScanHit>) {
-    let seen_ips: std::collections::HashSet<String> =
-        dst.iter().map(|x| x.ip.clone()).collect();
-    for hit in src {
-        if !seen_ips.contains(&hit.ip) {
-            dst.push(hit);
+fn parallel_rdns(hits: &[oximon::model::ScanHit]) -> HashMap<String, Option<String>> {
+    let mut out: HashMap<String, Option<String>> = HashMap::new();
+    let handles: Vec<_> = hits
+        .iter()
+        .map(|h| {
+            let ip = h.ip.clone();
+            std::thread::spawn(move || {
+                let r = oximon::scan::reverse_dns(&ip);
+                (ip, r)
+            })
+        })
+        .collect();
+    for h in handles {
+        if let Ok((ip, name)) = h.join() {
+            out.insert(ip, name);
         }
     }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_hits(
+    hits: &[oximon::model::ScanHit],
+    dns_map: &HashMap<String, Option<String>>,
+    db: &Arc<Mutex<Db>>,
+    oui: &Arc<oximon::oui::OuiDb>,
+    network_label: &str,
+    scan_ts: chrono::DateTime<chrono::Utc>,
+    prior_connected: &HashSet<String>,
+    hit_macs: &mut HashSet<String>,
+) -> Vec<(EventKind, Device)> {
+    let mut out: Vec<(EventKind, Device)> = Vec::new();
+    for hit in hits {
+        let mac = hit.mac.to_lowercase();
+        hit_macs.insert(mac.clone());
+        let existing = {
+            let db = db.lock().unwrap();
+            db.get_device(&mac).ok().flatten()
+        };
+        let hostname = dns_map.get(&hit.ip).cloned().flatten();
+        let vendor = oui.lookup(&mac).map(|s| s.to_string());
+
+        let (first_seen, previous_ip, previous_host, previous_connected, last_intensive) =
+            existing
+                .as_ref()
+                .map(|d| {
+                    (
+                        d.first_seen,
+                        Some(d.ip.clone()),
+                        d.hostname.clone(),
+                        d.connected,
+                        d.last_intensive,
+                    )
+                })
+                .unwrap_or((scan_ts, None, None, false, None));
+
+        let device = Device {
+            mac: mac.clone(),
+            ip: hit.ip.clone(),
+            hostname: hostname.clone().or(previous_host.clone()),
+            vendor: vendor
+                .clone()
+                .or_else(|| existing.as_ref().and_then(|d| d.vendor.clone())),
+            first_seen,
+            last_seen: scan_ts,
+            connected: true,
+            rtt_ms: hit.rtt_ms,
+            last_intensive,
+            os_guess: existing.as_ref().and_then(|d| d.os_guess.clone()),
+            alias: existing.as_ref().and_then(|d| d.alias.clone()),
+            last_network: Some(network_label.to_string()),
+        };
+        {
+            let db = db.lock().unwrap();
+            if let Err(e) = db.upsert_device(&device) {
+                tracing::warn!(?e, %mac, "upsert fail");
+            }
+            if let Err(e) = db.record_network(&mac, network_label, scan_ts) {
+                tracing::warn!(?e, %mac, "record_network fail");
+            }
+        }
+        if !previous_connected {
+            let db_l = db.lock().unwrap();
+            let _ = db_l.insert_event(&mac, EventKind::Connect, scan_ts, None);
+            drop(db_l);
+            if !prior_connected.contains(&mac) {
+                out.push((EventKind::Connect, device.clone()));
+            }
+        }
+        if let Some(prev) = previous_ip.as_deref() {
+            if prev != hit.ip {
+                let db_l = db.lock().unwrap();
+                let _ = db_l.insert_event(
+                    &mac,
+                    EventKind::IpChange,
+                    scan_ts,
+                    Some(&format!("{prev} -> {}", hit.ip)),
+                );
+            }
+        }
+        if let (Some(prev), Some(cur)) = (previous_host.as_deref(), hostname.as_deref()) {
+            if prev != cur {
+                let db_l = db.lock().unwrap();
+                let _ = db_l.insert_event(
+                    &mac,
+                    EventKind::HostnameChange,
+                    scan_ts,
+                    Some(&format!("{prev} -> {cur}")),
+                );
+            }
+        }
+    }
+    out
 }
 
 fn write_map_now(
@@ -753,65 +856,14 @@ async fn run_scan_tick(
     }
     let _ = map_tx.try_send(());
     let scan_ts = Utc::now();
+    let map_tx_inner = map_tx.clone();
     let events_result = tokio::task::spawn_blocking(move || -> Vec<(EventKind, Device)> {
         let cidr = scanner.subnet_cidr().to_string();
         let iface_for_net = scanner.iface_name().to_string();
         let network_label = oximon::scan::detect_network(&iface_for_net);
-        let mut hits: Vec<oximon::model::ScanHit> = Vec::new();
         let do_arp = matches!(scan_mode.as_str(), "auto" | "arp");
         let force_icmp = scan_mode == "icmp";
-        if do_arp && !force_icmp {
-            match scanner.scan_multi(
-                arp_passes,
-                Duration::from_millis(arp_window_ms),
-                Duration::from_millis(500),
-            ) {
-                Ok(h) => hits = h,
-                Err(e) => tracing::error!(?e, "arp scan err"),
-            }
-        }
-        // auto = union of ARP + ICMP (not fallback-only)
-        // dedup by IP (ARP trusted first; ICMP/nmap macs can be bogus on wifi)
-        if scan_mode == "auto" || force_icmp {
-            let iface = scanner.iface_name().to_string();
-            if let Ok(h) = oximon::scan::scan_broadcast_icmp(&iface, 2) {
-                let before = hits.len();
-                merge_hits(&mut hits, h);
-                tracing::info!(added = hits.len() - before, "broadcast icmp done");
-            }
 
-            tracing::info!(cidr = %cidr, arp_hits = hits.len(), "icmp sweep");
-            match oximon::scan::scan_icmp(&cidr, icmp_timeout_s) {
-                Ok(h) => {
-                    tracing::info!(hits = h.len(), "icmp scan done");
-                    merge_hits(&mut hits, h);
-                }
-                Err(e) => tracing::warn!(?e, "icmp scan err"),
-            }
-        }
-        tracing::info!(hits = hits.len(), "processing hits");
-
-        let mut dns_map: HashMap<String, Option<String>> = HashMap::new();
-        {
-            let handles: Vec<_> = hits
-                .iter()
-                .map(|h| {
-                    let ip = h.ip.clone();
-                    std::thread::spawn(move || {
-                        let r = oximon::scan::reverse_dns(&ip);
-                        (ip, r)
-                    })
-                })
-                .collect();
-            for h in handles {
-                if let Ok((ip, name)) = h.join() {
-                    dns_map.insert(ip, name);
-                }
-            }
-        }
-        tracing::info!("rdns done");
-
-        let hit_macs: HashSet<String> = hits.iter().map(|h| h.mac.to_lowercase()).collect();
         let prior_connected: HashSet<String> = {
             let db = db.lock().unwrap();
             db.all_devices()
@@ -821,89 +873,66 @@ async fn run_scan_tick(
                 .map(|d| d.mac.to_lowercase())
                 .collect()
         };
-
+        let mut hit_macs: HashSet<String> = HashSet::new();
+        let mut seen_ips: HashSet<String> = HashSet::new();
         let mut new_events: Vec<(EventKind, Device)> = Vec::new();
 
-        for hit in &hits {
-            let mac = hit.mac.to_lowercase();
-            let existing = {
-                let db = db.lock().unwrap();
-                db.get_device(&mac).ok().flatten()
-            };
-            let hostname = dns_map.get(&hit.ip).cloned().flatten();
-            let vendor = oui.lookup(&mac).map(|s| s.to_string());
-
-            let (first_seen, previous_ip, previous_host, previous_connected, last_intensive) =
-                existing
-                    .as_ref()
-                    .map(|d| {
-                        (
-                            d.first_seen,
-                            Some(d.ip.clone()),
-                            d.hostname.clone(),
-                            d.connected,
-                            d.last_intensive,
-                        )
-                    })
-                    .unwrap_or((scan_ts, None, None, false, None));
-
-            let device = Device {
-                mac: mac.clone(),
-                ip: hit.ip.clone(),
-                hostname: hostname.clone().or(previous_host.clone()),
-                vendor: vendor
-                    .clone()
-                    .or_else(|| existing.as_ref().and_then(|d| d.vendor.clone())),
-                first_seen,
-                last_seen: scan_ts,
-                connected: true,
-                rtt_ms: hit.rtt_ms,
-                last_intensive,
-                os_guess: existing.as_ref().and_then(|d| d.os_guess.clone()),
-                alias: existing.as_ref().and_then(|d| d.alias.clone()),
-                last_network: Some(network_label.clone()),
-            };
-
-            {
-                let db = db.lock().unwrap();
-                if let Err(e) = db.upsert_device(&device) {
-                    tracing::warn!(?e, mac=%mac, "upsert fail");
-                }
-                if let Err(e) = db.record_network(&mac, &network_label, scan_ts) {
-                    tracing::warn!(?e, mac=%mac, "record_network fail");
-                }
+        let flush_phase = |phase: &str, raw: Vec<oximon::model::ScanHit>,
+                               hit_macs: &mut HashSet<String>,
+                               seen_ips: &mut HashSet<String>,
+                               new_events: &mut Vec<(EventKind, Device)>| {
+            let fresh: Vec<oximon::model::ScanHit> = raw
+                .into_iter()
+                .filter(|h| !seen_ips.contains(&h.ip))
+                .collect();
+            if fresh.is_empty() {
+                tracing::info!(phase, added = 0, "phase flush");
+                return;
             }
+            let dns_map = parallel_rdns(&fresh);
+            let ev = process_hits(
+                &fresh,
+                &dns_map,
+                &db,
+                &oui,
+                &network_label,
+                scan_ts,
+                &prior_connected,
+                hit_macs,
+            );
+            for h in &fresh {
+                seen_ips.insert(h.ip.clone());
+            }
+            new_events.extend(ev);
+            tracing::info!(phase, added = fresh.len(), total = seen_ips.len(), "phase flush");
+            let _ = map_tx_inner.try_send(());
+        };
 
-            let newly_connected = !previous_connected;
-            if newly_connected {
-                let db_l = db.lock().unwrap();
-                let _ = db_l.insert_event(&mac, EventKind::Connect, scan_ts, None);
-                drop(db_l);
-                new_events.push((EventKind::Connect, device.clone()));
-            }
-            if let Some(prev) = previous_ip.as_deref() {
-                if prev != hit.ip {
-                    let db_l = db.lock().unwrap();
-                    let _ = db_l.insert_event(
-                        &mac,
-                        EventKind::IpChange,
-                        scan_ts,
-                        Some(&format!("{prev} -> {}", hit.ip)),
-                    );
-                }
-            }
-            if let (Some(prev), Some(cur)) = (previous_host.as_deref(), hostname.as_deref()) {
-                if prev != cur {
-                    let db_l = db.lock().unwrap();
-                    let _ = db_l.insert_event(
-                        &mac,
-                        EventKind::HostnameChange,
-                        scan_ts,
-                        Some(&format!("{prev} -> {cur}")),
-                    );
-                }
+        // phase 1: ARP
+        if do_arp && !force_icmp {
+            match scanner.scan_multi(
+                arp_passes,
+                Duration::from_millis(arp_window_ms),
+                Duration::from_millis(500),
+            ) {
+                Ok(h) => flush_phase("arp", h, &mut hit_macs, &mut seen_ips, &mut new_events),
+                Err(e) => tracing::error!(?e, "arp scan err"),
             }
         }
+        // phase 2+3: broadcast + nmap
+        if scan_mode == "auto" || force_icmp {
+            let iface = scanner.iface_name().to_string();
+            if let Ok(h) = oximon::scan::scan_broadcast_icmp(&iface, 2) {
+                flush_phase("bcast_icmp", h, &mut hit_macs, &mut seen_ips, &mut new_events);
+            }
+            tracing::info!(cidr = %cidr, sofar = seen_ips.len(), "icmp sweep");
+            match oximon::scan::scan_icmp(&cidr, icmp_timeout_s) {
+                Ok(h) => flush_phase("nmap_sn", h, &mut hit_macs, &mut seen_ips, &mut new_events),
+                Err(e) => tracing::warn!(?e, "icmp scan err"),
+            }
+        }
+
+        tracing::info!(hits = seen_ips.len(), "all phases done");
 
         let gone: Vec<String> = prior_connected.difference(&hit_macs).cloned().collect();
         for mac in gone {
@@ -918,7 +947,7 @@ async fn run_scan_tick(
             }
         }
 
-        tracing::info!(hits = hits.len(), "scan tick");
+        tracing::info!(hits = seen_ips.len(), "scan tick");
 
         // prune event log
         {

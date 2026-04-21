@@ -1,11 +1,7 @@
 use anyhow::{Context, Result};
-use pnet::datalink::{self, Channel, Config as DlConfig, NetworkInterface};
-use pnet::packet::Packet;
-use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
-use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::udp::UdpPacket;
-use std::net::Ipv4Addr;
+use pnet::datalink::NetworkInterface;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -13,62 +9,205 @@ use std::time::Duration;
 use crate::db::Db;
 
 pub fn spawn_passive_sniff(iface: NetworkInterface, db: Arc<Mutex<Db>>) {
+    let local_ip = iface
+        .ips
+        .iter()
+        .find_map(|n| match n.ip() {
+            IpAddr::V4(v) => Some(v),
+            _ => None,
+        })
+        .unwrap_or(Ipv4Addr::UNSPECIFIED);
+    let iface_name = iface.name.clone();
+
+    // mDNS: 224.0.0.251:5353
+    spawn_mcast_listener(
+        "mdns",
+        5353,
+        Ipv4Addr::new(224, 0, 0, 251),
+        local_ip,
+        iface_name.clone(),
+        db.clone(),
+        handle_mdns,
+    );
+    // SSDP: 239.255.255.250:1900
+    spawn_mcast_listener(
+        "ssdp",
+        1900,
+        Ipv4Addr::new(239, 255, 255, 250),
+        local_ip,
+        iface_name.clone(),
+        db.clone(),
+        handle_ssdp,
+    );
+    // NBNS: broadcast 137
+    spawn_broadcast_listener("nbns", 137, local_ip, iface_name.clone(), db.clone(), handle_nbns);
+
+    // active mDNS service enumeration — periodic blast that forces devices to announce
+    spawn_mdns_prober(local_ip);
+}
+
+fn make_reuse_socket(domain: Domain, ty: Type, proto: Option<Protocol>) -> Result<Socket> {
+    let s = Socket::new(domain, ty, proto)?;
+    s.set_reuse_address(true)?;
+    #[cfg(unix)]
+    s.set_reuse_port(true).ok();
+    Ok(s)
+}
+
+fn spawn_mcast_listener<F>(
+    label: &'static str,
+    port: u16,
+    group: Ipv4Addr,
+    local_ip: Ipv4Addr,
+    iface_name: String,
+    db: Arc<Mutex<Db>>,
+    handler: F,
+) where
+    F: Fn(&[u8], Ipv4Addr, &Arc<Mutex<Db>>) + Send + Sync + 'static,
+{
     std::thread::Builder::new()
-        .name("oximon-sniff".into())
+        .name(format!("oximon-sniff-{label}"))
         .spawn(move || {
-            if let Err(e) = run(iface, db) {
-                tracing::warn!(?e, "sniff exited");
+            let sock = match bind_multicast(port, group, local_ip) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(?e, label, "sniff bind fail");
+                    return;
+                }
+            };
+            let _ = iface_name;
+            sock.set_read_timeout(Some(Duration::from_millis(1000))).ok();
+            tracing::info!(label, port, group = %group, "sniff listening");
+            let mut buf = [0u8; 9000];
+            loop {
+                match sock.recv_from(&mut buf) {
+                    Ok((n, src)) => {
+                        if let IpAddr::V4(v4) = src.ip() {
+                            handler(&buf[..n], v4, &db);
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut
+                        {
+                            continue;
+                        }
+                        tracing::debug!(?e, label, "sniff recv err");
+                    }
+                }
             }
         })
         .ok();
 }
 
-fn run(iface: NetworkInterface, db: Arc<Mutex<Db>>) -> Result<()> {
-    let cfg = DlConfig {
-        read_timeout: Some(Duration::from_millis(500)),
-        ..Default::default()
-    };
-    let (_tx, mut rx) = match datalink::channel(&iface, cfg).context("sniff channel")? {
-        Channel::Ethernet(tx, rx) => (tx, rx),
-        _ => anyhow::bail!("unsupported channel"),
-    };
-    tracing::info!(iface = %iface.name, "passive sniff started");
-    loop {
-        match rx.next() {
-            Ok(frame) => {
-                let Some(eth) = EthernetPacket::new(frame) else { continue };
-                if eth.get_ethertype() != EtherTypes::Ipv4 {
-                    continue;
+fn bind_multicast(port: u16, group: Ipv4Addr, local_ip: Ipv4Addr) -> Result<UdpSocket> {
+    let sock = make_reuse_socket(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let addr: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    sock.bind(&SockAddr::from(addr))?;
+    let sock: UdpSocket = sock.into();
+    sock.join_multicast_v4(&group, &local_ip)
+        .with_context(|| format!("join {group} on {local_ip}"))?;
+    Ok(sock)
+}
+
+fn spawn_broadcast_listener<F>(
+    label: &'static str,
+    port: u16,
+    _local_ip: Ipv4Addr,
+    iface_name: String,
+    db: Arc<Mutex<Db>>,
+    handler: F,
+) where
+    F: Fn(&[u8], Ipv4Addr, &Arc<Mutex<Db>>) + Send + Sync + 'static,
+{
+    std::thread::Builder::new()
+        .name(format!("oximon-sniff-{label}"))
+        .spawn(move || {
+            let sock = match make_reuse_socket(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(?e, label, "sniff socket err");
+                    return;
                 }
-                let Some(ip4) = Ipv4Packet::new(eth.payload()) else { continue };
-                if ip4.get_next_level_protocol() != IpNextHeaderProtocols::Udp {
-                    continue;
-                }
-                let Some(udp) = UdpPacket::new(ip4.payload()) else { continue };
-                let src_ip = ip4.get_source();
-                let payload = udp.payload();
-                match udp.get_destination() {
-                    5353 => handle_mdns(payload, src_ip, &db),
-                    1900 => handle_ssdp(payload, src_ip, &db),
-                    137 => handle_nbns(payload, src_ip, &db),
-                    67 | 68 => handle_dhcp(payload, src_ip, &db),
-                    _ => {}
-                }
-                // mDNS also sent from src=5353
-                if udp.get_source() == 5353 {
-                    handle_mdns(payload, src_ip, &db);
+            };
+            let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
+            if let Err(e) = sock.bind(&SockAddr::from(SocketAddr::V4(addr))) {
+                tracing::warn!(?e, label, port, "sniff bind fail");
+                return;
+            }
+            sock.set_broadcast(true).ok();
+            let sock: UdpSocket = sock.into();
+            sock.set_read_timeout(Some(Duration::from_millis(1000))).ok();
+            let _ = iface_name;
+            tracing::info!(label, port, "sniff listening (broadcast)");
+            let mut buf = [0u8; 9000];
+            loop {
+                match sock.recv_from(&mut buf) {
+                    Ok((n, src)) => {
+                        if let IpAddr::V4(v4) = src.ip() {
+                            handler(&buf[..n], v4, &db);
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut
+                        {
+                            continue;
+                        }
+                        tracing::debug!(?e, label, "sniff recv err");
+                    }
                 }
             }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::TimedOut
-                    || e.kind() == std::io::ErrorKind::WouldBlock
-                {
-                    continue;
+        })
+        .ok();
+}
+
+/// periodically send `_services._dns-sd._udp.local` PTR query to mDNS group → every
+/// mDNS-capable device responds, we catch it in the mDNS listener
+fn spawn_mdns_prober(local_ip: Ipv4Addr) {
+    std::thread::Builder::new()
+        .name("oximon-mdns-prober".into())
+        .spawn(move || {
+            let sock = match mdns_query_socket(local_ip) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(?e, "mdns prober socket fail");
+                    return;
                 }
-                tracing::debug!(?e, "sniff recv err");
+            };
+            loop {
+                if let Err(e) = send_mdns_enumeration(&sock) {
+                    tracing::debug!(?e, "mdns query send fail");
+                }
+                std::thread::sleep(Duration::from_secs(90));
             }
-        }
-    }
+        })
+        .ok();
+}
+
+fn mdns_query_socket(local_ip: Ipv4Addr) -> Result<UdpSocket> {
+    let sock = make_reuse_socket(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    sock.bind(&SockAddr::from(addr))?;
+    let _ = sock.set_multicast_if_v4(&local_ip);
+    let sock: UdpSocket = sock.into();
+    sock.set_multicast_loop_v4(false).ok();
+    Ok(sock)
+}
+
+fn send_mdns_enumeration(sock: &UdpSocket) -> Result<()> {
+    use simple_dns::{Name, Packet, Question, rdata::TYPE};
+    let mut pkt = Packet::new_query(0);
+    pkt.questions.push(Question::new(
+        Name::new("_services._dns-sd._udp.local").context("name")?,
+        TYPE::PTR.into(),
+        simple_dns::CLASS::IN.into(),
+        false,
+    ));
+    let buf = pkt.build_bytes_vec()?;
+    sock.send_to(&buf, (Ipv4Addr::new(224, 0, 0, 251), 5353))?;
+    tracing::debug!("mdns enumeration query sent");
+    Ok(())
 }
 
 fn clean_hostname(raw: &str) -> String {
@@ -101,26 +240,26 @@ fn handle_mdns(payload: &[u8], src: Ipv4Addr, db: &Arc<Mutex<Db>>) {
     use simple_dns::Packet;
     use simple_dns::rdata::RData;
     let Ok(pkt) = Packet::parse(payload) else { return };
-    // answers list: look for A records binding hostname → ip
     for ans in pkt.answers.iter() {
         let name = ans.name.to_string();
         match &ans.rdata {
             RData::A(a) => {
-                let ip: Ipv4Addr = std::net::Ipv4Addr::from(a.address);
+                let ip: Ipv4Addr = Ipv4Addr::from(a.address);
                 update_for_ip(db, ip, &name);
             }
-            RData::AAAA(_) => {
-                // v6 — match by name to src_ip
-                update_for_ip(db, src, &name);
+            RData::PTR(p) => {
+                // service enumeration replies
+                let target = p.0.to_string();
+                update_for_ip(db, src, &target);
             }
+            RData::AAAA(_) => update_for_ip(db, src, &name),
             _ => {}
         }
     }
-    // additional records can also carry A/PTR
     for ans in pkt.additional_records.iter() {
         let name = ans.name.to_string();
         if let RData::A(a) = &ans.rdata {
-            let ip: Ipv4Addr = std::net::Ipv4Addr::from(a.address);
+            let ip: Ipv4Addr = Ipv4Addr::from(a.address);
             update_for_ip(db, ip, &name);
         }
     }
@@ -131,33 +270,41 @@ fn handle_ssdp(payload: &[u8], src: Ipv4Addr, db: &Arc<Mutex<Db>>) {
         Ok(s) => s,
         Err(_) => return,
     };
-    // SSDP = HTTP-like. Lines: NOTIFY * HTTP/1.1 ... SERVER: foo/bar
     let mut server: Option<&str> = None;
     let mut usn: Option<&str> = None;
+    let mut nt: Option<&str> = None;
     for line in text.lines() {
-        let (k, v) = match line.split_once(':') {
-            Some(x) => x,
-            None => continue,
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
         };
         let k = k.trim().to_ascii_lowercase();
         let v = v.trim();
         match k.as_str() {
             "server" => server = Some(v),
             "usn" => usn = Some(v),
+            "nt" | "st" => nt = Some(v),
             _ => {}
         }
     }
-    if let Some(s) = server.or(usn) {
-        // server string like "Linux/5.10 UPnP/1.0 MyDevice/1.0"
-        let short = s.split(' ').last().unwrap_or(s);
-        if !short.is_empty() {
-            update_for_ip(db, src, short);
+    if let Some(s) = server {
+        // usually "Linux/5.10 UPnP/1.0 Foo/1.0" - take last non-UPnP token
+        let tail = s.split_whitespace().last().unwrap_or(s);
+        if !tail.is_empty() && !tail.starts_with("UPnP") {
+            update_for_ip(db, src, tail);
+            return;
+        }
+    }
+    if let Some(u) = usn.or(nt) {
+        // "urn:schemas-upnp-org:device:MediaRenderer:1" → MediaRenderer
+        if let Some(tail) = u.split(':').last() {
+            if !tail.is_empty() {
+                update_for_ip(db, src, tail);
+            }
         }
     }
 }
 
 fn handle_nbns(payload: &[u8], src: Ipv4Addr, db: &Arc<Mutex<Db>>) {
-    // NBNS name-registration or response. Flags at offset 2-3, bit 15 = response.
     if payload.len() < 12 {
         return;
     }
@@ -166,7 +313,6 @@ fn handle_nbns(payload: &[u8], src: Ipv4Addr, db: &Arc<Mutex<Db>>) {
     if !is_response {
         return;
     }
-    // encoded name at offset 12: 1-byte length (0x20=32), then 32 bytes encoded, then 0x00.
     let first = payload[12] as usize;
     if first == 0 || first > payload.len() - 13 {
         return;
@@ -184,50 +330,9 @@ fn handle_nbns(payload: &[u8], src: Ipv4Addr, db: &Arc<Mutex<Db>>) {
         let lo = chunk[1].wrapping_sub(b'A');
         decoded[i] = (hi << 4) | (lo & 0xF);
     }
-    // NetBIOS names are 15-char + 1 byte suffix, space-padded
     let name_bytes = &decoded[..15];
     let name = String::from_utf8_lossy(name_bytes).trim().to_string();
     if !name.is_empty() {
         update_for_ip(db, src, &name);
-    }
-}
-
-fn handle_dhcp(payload: &[u8], src: Ipv4Addr, db: &Arc<Mutex<Db>>) {
-    // DHCP options: magic cookie 99,130,83,99 at offset 236
-    if payload.len() < 240 {
-        return;
-    }
-    if &payload[236..240] != &[99u8, 130, 83, 99] {
-        return;
-    }
-    let mut i = 240;
-    while i < payload.len() {
-        let opt = payload[i];
-        if opt == 0xff {
-            break;
-        }
-        if opt == 0x00 {
-            i += 1;
-            continue;
-        }
-        if i + 1 >= payload.len() {
-            break;
-        }
-        let len = payload[i + 1] as usize;
-        let val_start = i + 2;
-        let val_end = val_start + len;
-        if val_end > payload.len() {
-            break;
-        }
-        if opt == 12 {
-            // hostname
-            if let Ok(s) = std::str::from_utf8(&payload[val_start..val_end]) {
-                let h = s.trim().trim_matches('\0').to_string();
-                if !h.is_empty() {
-                    update_for_ip(db, src, &h);
-                }
-            }
-        }
-        i = val_end;
     }
 }
