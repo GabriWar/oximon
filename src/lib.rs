@@ -9,6 +9,7 @@ pub mod notify;
 pub mod oui;
 pub mod paths;
 pub mod scan;
+pub mod sniff;
 pub mod tray;
 
 pub use config::Config;

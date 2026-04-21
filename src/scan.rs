@@ -14,6 +14,7 @@ pub struct ArpScanner {
     src_ip: Ipv4Addr,
     src_mac: MacAddr,
     subnet: Vec<Ipv4Addr>,
+    subnet_cidr: String,
 }
 
 impl ArpScanner {
@@ -23,21 +24,30 @@ impl ArpScanner {
             .mac
             .ok_or_else(|| anyhow!("iface {} has no mac", iface.name))?;
         let (src_ip, prefix) = pick_ipv4(&iface)?;
-        let subnet = if let Some(cidr) = subnet_hint {
-            parse_cidr(cidr)?
+        let (subnet, subnet_cidr) = if let Some(cidr) = subnet_hint {
+            (parse_cidr(cidr)?, cidr.to_string())
         } else {
-            hosts_for(src_ip, prefix)
+            (hosts_for(src_ip, prefix), format!("{}/{}", subnet_base(src_ip, prefix), prefix))
         };
         Ok(Self {
             iface,
             src_ip,
             src_mac,
             subnet,
+            subnet_cidr,
         })
+    }
+
+    pub fn subnet_cidr(&self) -> &str {
+        &self.subnet_cidr
     }
 
     pub fn iface_name(&self) -> &str {
         &self.iface.name
+    }
+
+    pub fn iface(&self) -> NetworkInterface {
+        self.iface.clone()
     }
 
     pub fn subnet_size(&self) -> usize {
@@ -138,6 +148,117 @@ impl ArpScanner {
     }
 }
 
+/// L3 ping sweep via `nmap -sn`. Returns alive IPs + MAC (when available via ARP cache).
+pub fn scan_icmp(cidr: &str, timeout_s: u64) -> Result<Vec<ScanHit>> {
+    let out = std::process::Command::new("nmap")
+        .args([
+            "--privileged",
+            "-sn",
+            "-n",
+            "-T4",
+            "--disable-arp-ping",
+            "--host-timeout",
+            &format!("{timeout_s}s"),
+            "-oX",
+            "-",
+            cidr,
+        ])
+        .output()
+        .context("nmap -sn exec")?;
+    parse_nmap_hosts(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_nmap_hosts(xml: &str) -> Result<Vec<ScanHit>> {
+    use quick_xml::events::Event as XmlEvent;
+    use quick_xml::reader::Reader;
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut hits: Vec<ScanHit> = Vec::new();
+    let mut cur_ip: Option<String> = None;
+    let mut cur_mac: Option<String> = None;
+    let mut cur_up = false;
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(XmlEvent::Start(e)) | Ok(XmlEvent::Empty(e)) => {
+                let name = e.name();
+                let tag = std::str::from_utf8(name.as_ref()).unwrap_or("");
+                match tag {
+                    "host" => {
+                        cur_ip = None;
+                        cur_mac = None;
+                        cur_up = false;
+                    }
+                    "status" => {
+                        for a in e.attributes().flatten() {
+                            if std::str::from_utf8(a.key.as_ref()).unwrap_or("") == "state" {
+                                let v = a.unescape_value().unwrap_or_default().to_string();
+                                cur_up = v == "up";
+                            }
+                        }
+                    }
+                    "address" => {
+                        let mut addr: Option<String> = None;
+                        let mut addrtype: Option<String> = None;
+                        for a in e.attributes().flatten() {
+                            let k = std::str::from_utf8(a.key.as_ref()).unwrap_or("");
+                            let v = a.unescape_value().unwrap_or_default().to_string();
+                            match k {
+                                "addr" => addr = Some(v),
+                                "addrtype" => addrtype = Some(v),
+                                _ => {}
+                            }
+                        }
+                        match (addr, addrtype.as_deref()) {
+                            (Some(a), Some("ipv4")) => cur_ip = Some(a),
+                            (Some(a), Some("mac")) => cur_mac = Some(a.to_lowercase()),
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(XmlEvent::End(e)) => {
+                let name = e.name();
+                if std::str::from_utf8(name.as_ref()).unwrap_or("") == "host" {
+                    if cur_up {
+                        if let Some(ip) = cur_ip.take() {
+                            let mac = cur_mac.take().unwrap_or_else(|| {
+                                read_arp_mac(&ip).unwrap_or_else(|| "00:00:00:00:00:00".into())
+                            });
+                            hits.push(ScanHit { ip, mac, rtt_ms: None });
+                        }
+                    }
+                }
+            }
+            Ok(XmlEvent::Eof) => break,
+            Err(e) => {
+                tracing::warn!(?e, "icmp xml parse");
+                break;
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(hits)
+}
+
+fn read_arp_mac(ip: &str) -> Option<String> {
+    let content = std::fs::read_to_string("/proc/net/arp").ok()?;
+    for line in content.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        if parts[0] == ip && parts[3] != "00:00:00:00:00:00" {
+            return Some(parts[3].to_lowercase());
+        }
+    }
+    None
+}
+
 pub fn reverse_dns(ip: &str) -> Option<String> {
     reverse_dns_timeout(ip, Duration::from_millis(400))
 }
@@ -182,6 +303,12 @@ fn pick_ipv4(iface: &NetworkInterface) -> Result<(Ipv4Addr, u8)> {
         }
     }
     Err(anyhow!("no ipv4 on iface {}", iface.name))
+}
+
+fn subnet_base(ip: Ipv4Addr, prefix: u8) -> Ipv4Addr {
+    let prefix = prefix.clamp(0, 32);
+    let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    Ipv4Addr::from(u32::from(ip) & mask)
 }
 
 fn hosts_for(ip: Ipv4Addr, prefix: u8) -> Vec<Ipv4Addr> {

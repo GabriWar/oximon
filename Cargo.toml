@@ -34,6 +34,7 @@ chrono = { version = "0.4", features = ["serde"] }
 directories = "5"
 quick-xml = { version = "0.36", features = ["serialize"] }
 dns-lookup = "2"
+simple-dns = "0.7"
 ksni = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"

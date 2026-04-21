@@ -99,6 +99,26 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_hostname_if_empty(&self, mac: &str, hostname: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE devices SET hostname = ?2 WHERE mac = ?1 AND (hostname IS NULL OR hostname = '' OR hostname = mac)",
+            params![mac, hostname],
+        )?;
+        Ok(n)
+    }
+
+    pub fn find_mac_by_ip(&self, ip: &str) -> Result<Option<String>> {
+        let r = self
+            .conn
+            .query_row(
+                "SELECT mac FROM devices WHERE ip = ?1 LIMIT 1",
+                params![ip],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(r)
+    }
+
     pub fn set_alias(&self, mac: &str, alias: Option<&str>) -> Result<usize> {
         let n = self.conn.execute(
             "UPDATE devices SET alias = ?2 WHERE mac = ?1",

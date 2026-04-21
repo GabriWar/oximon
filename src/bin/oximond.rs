@@ -54,6 +54,12 @@ struct Cli {
     /// disable http server
     #[arg(long)]
     no_http: bool,
+    /// scan mode: auto (arp + icmp fallback), arp (only), icmp (L3 only)
+    #[arg(long, default_value = "auto")]
+    scan_mode: String,
+    /// nmap -sn timeout seconds for icmp fallback
+    #[arg(long, default_value_t = 90)]
+    icmp_timeout_s: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -182,6 +188,8 @@ async fn run_daemon(args: Cli) -> Result<()> {
             .context("arp scanner init (need CAP_NET_RAW)")?,
     );
     let iface_name = scanner.iface_name().to_string();
+    let sniff_iface = scanner.iface();
+    oximon::sniff::spawn_passive_sniff(sniff_iface, db.clone());
     tracing::info!(
         iface = %iface_name,
         hosts = scanner.subnet_size(),
@@ -435,6 +443,7 @@ async fn run_daemon(args: Cli) -> Result<()> {
                     scanner.clone(), db.clone(), oui.clone(), notify_on.clone(),
                     &map_path, &iface_name, args.arp_passes, args.arp_window_ms,
                     arp_scanning.clone(), map_tx.clone(), running.clone(),
+                    args.scan_mode.clone(), args.icmp_timeout_s,
                 ).await;
                 let _ = map_tx.try_send(());
                 update_tray(&tray_handle, &db, &iface_name, notify_on.load(Ordering::Relaxed));
@@ -446,6 +455,7 @@ async fn run_daemon(args: Cli) -> Result<()> {
                     scanner.clone(), db.clone(), oui.clone(), notify_on.clone(),
                     &map_path, &iface_name, args.arp_passes, args.arp_window_ms,
                     arp_scanning.clone(), map_tx.clone(), running.clone(),
+                    args.scan_mode.clone(), args.icmp_timeout_s,
                 ).await;
                 let _ = map_tx.try_send(());
                 update_tray(&tray_handle, &db, &iface_name, notify_on.load(Ordering::Relaxed));
@@ -714,6 +724,8 @@ async fn run_scan_tick(
     arp_flag: Arc<AtomicBool>,
     map_tx: mpsc::Sender<()>,
     running: Arc<Mutex<Vec<oximon::html::RunningView>>>,
+    scan_mode: String,
+    icmp_timeout_s: u64,
 ) {
     tracing::info!("scan start");
     let _ = map_path;
@@ -730,17 +742,37 @@ async fn run_scan_tick(
     let _ = map_tx.try_send(());
     let scan_ts = Utc::now();
     let events_result = tokio::task::spawn_blocking(move || -> Vec<(EventKind, Device)> {
-        let hits = match scanner.scan_multi(
-            arp_passes,
-            Duration::from_millis(arp_window_ms),
-            Duration::from_millis(500),
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!(?e, "scan err");
-                return Vec::new();
+        let cidr = scanner.subnet_cidr().to_string();
+        let mut hits: Vec<oximon::model::ScanHit> = Vec::new();
+        let do_arp = matches!(scan_mode.as_str(), "auto" | "arp");
+        let force_icmp = scan_mode == "icmp";
+        if do_arp && !force_icmp {
+            match scanner.scan_multi(
+                arp_passes,
+                Duration::from_millis(arp_window_ms),
+                Duration::from_millis(500),
+            ) {
+                Ok(h) => hits = h,
+                Err(e) => tracing::error!(?e, "arp scan err"),
             }
-        };
+        }
+        if (hits.is_empty() && scan_mode == "auto") || force_icmp {
+            tracing::info!(cidr = %cidr, "icmp fallback");
+            match oximon::scan::scan_icmp(&cidr, icmp_timeout_s) {
+                Ok(h) => {
+                    tracing::info!(hits = h.len(), "icmp scan done");
+                    // merge (dedup by mac)
+                    let seen: std::collections::HashSet<String> =
+                        hits.iter().map(|x| x.mac.to_lowercase()).collect();
+                    for hit in h {
+                        if !seen.contains(&hit.mac.to_lowercase()) {
+                            hits.push(hit);
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(?e, "icmp scan err"),
+            }
+        }
         tracing::info!(hits = hits.len(), "processing hits");
 
         let mut dns_map: HashMap<String, Option<String>> = HashMap::new();
