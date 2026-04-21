@@ -46,6 +46,7 @@ struct NodeData<'a> {
     label: String,
     ip: &'a str,
     mac: &'a str,
+    alias: Option<&'a str>,
     hostname: Option<&'a str>,
     vendor: Option<&'a str>,
     os_guess: Option<&'a str>,
@@ -259,7 +260,11 @@ fn render_inner(
                 })
                 .collect();
             let is_gw = Some(d.ip.as_str()) == gateway_ip;
-            let label = d.hostname.clone().unwrap_or_else(|| d.ip.clone());
+            let label = d
+                .alias
+                .clone()
+                .or_else(|| d.hostname.clone())
+                .unwrap_or_else(|| d.ip.clone());
             let os_kind = classify_os(d.os_guess.as_deref(), d.vendor.as_deref());
             Node {
                 data: NodeData {
@@ -267,6 +272,7 @@ fn render_inner(
                     label,
                     ip: d.ip.as_str(),
                     mac: d.mac.as_str(),
+                    alias: d.alias.as_deref(),
                     hostname: d.hostname.as_deref(),
                     vendor: d.vendor.as_deref(),
                     os_guess: d.os_guess.as_deref(),

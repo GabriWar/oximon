@@ -13,6 +13,7 @@ pub struct Device {
     pub rtt_ms: Option<f32>,
     pub last_intensive: Option<DateTime<Utc>>,
     pub os_guess: Option<String>,
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

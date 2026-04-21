@@ -633,6 +633,7 @@ function renderSidebar(d){
   if (d.is_gateway) header.appendChild(el('span', { cls: 'badge gw', text: 'gateway' }));
 
   const kvGrid = el('div', { cls: 'kv-grid', children: [
+    ...kv('alias', d.alias || '-', d.alias ? '' : 'dim'),
     ...kv('ip', d.ip, 'mono'),
     ...kv('mac', d.mac, 'mono'),
     ...kv('hostname', d.hostname || 'unknown', d.hostname ? '' : 'dim'),
@@ -661,6 +662,14 @@ function renderSidebar(d){
         finally { btn.disabled = false; }
       }}}),
       el('label', { children: [fullCb, document.createTextNode('all 65535 ports')] }),
+      el('button', { text: d.alias ? 'rename' : 'set alias', on: { click: async () => {
+        const name = prompt('alias for ' + (d.hostname || d.ip) + ' (blank to clear):', d.alias || '');
+        if (name === null) return;
+        try {
+          const r = await api('/api/alias', { mac: d.mac, alias: name });
+          toast('alias ' + (r.alias ? 'set: ' + r.alias : 'cleared'), 'ok');
+        } catch (err) { toast(String(err), 'err'); }
+      }}}),
       el('button', { text: 'back', on: { click: () => { selectedMac = null; cy.$(':selected').unselect(); renderOverview(); }}}),
     ]}));
   }

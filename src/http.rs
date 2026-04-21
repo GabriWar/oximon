@@ -34,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/state", get(api_state))
         .route("/api/intensive", post(api_intensive))
         .route("/api/scan_subnet", post(api_scan_subnet))
+        .route("/api/alias", post(api_alias))
         .route("/api/mute", post(api_mute))
         .route("/api/unmute", post(api_unmute))
         .route("/api/toggle_mute", post(api_toggle_mute))
@@ -219,6 +220,33 @@ fn ip_in_subnet(ip_str: &str, base: u32, prefix: u8) -> bool {
     let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else { return false };
     let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
     (u32::from(ip) & mask) == base
+}
+
+#[derive(Deserialize)]
+struct AliasReq {
+    mac: String,
+    #[serde(default)]
+    alias: Option<String>,
+}
+
+async fn api_alias(
+    State(state): State<AppState>,
+    Json(req): Json<AliasReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mac = req.mac.to_lowercase();
+    let alias = req.alias.and_then(|s| {
+        let t = s.trim().to_string();
+        if t.is_empty() { None } else { Some(t) }
+    });
+    let n = {
+        let db = state.db.lock().unwrap();
+        db.set_alias(&mac, alias.as_deref()).unwrap_or(0)
+    };
+    if n == 0 {
+        return Err((StatusCode::NOT_FOUND, "no such mac".into()));
+    }
+    let _ = state.map_tx.try_send(());
+    Ok(Json(serde_json::json!({"ok": true, "mac": mac, "alias": alias})))
 }
 
 async fn api_mute(State(state): State<AppState>) -> Json<serde_json::Value> {

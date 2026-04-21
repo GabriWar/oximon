@@ -33,7 +33,8 @@ impl Db {
                 connected INTEGER NOT NULL DEFAULT 0,
                 rtt_ms REAL,
                 last_intensive TEXT,
-                os_guess TEXT
+                os_guess TEXT,
+                alias TEXT
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -46,6 +47,13 @@ impl Db {
             CREATE INDEX IF NOT EXISTS events_mac_ts ON events(mac, ts DESC);
             CREATE INDEX IF NOT EXISTS events_ts ON events(ts DESC);
 
+            -- migrations for existing dbs
+            "#,
+        )?;
+        // attempt alias column add (ignore error if exists)
+        let _ = self.conn.execute("ALTER TABLE devices ADD COLUMN alias TEXT", []);
+        self.conn.execute_batch(
+            r#"
             CREATE TABLE IF NOT EXISTS ports (
                 mac TEXT NOT NULL,
                 port INTEGER NOT NULL,
@@ -64,8 +72,8 @@ impl Db {
     pub fn upsert_device(&self, d: &Device) -> Result<()> {
         self.conn.execute(
             r#"
-            INSERT INTO devices (mac, ip, hostname, vendor, first_seen, last_seen, connected, rtt_ms, last_intensive, os_guess)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            INSERT INTO devices (mac, ip, hostname, vendor, first_seen, last_seen, connected, rtt_ms, last_intensive, os_guess, alias)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(mac) DO UPDATE SET
                 ip = excluded.ip,
                 hostname = COALESCE(excluded.hostname, devices.hostname),
@@ -85,9 +93,18 @@ impl Db {
                 d.rtt_ms,
                 d.last_intensive.map(|t| t.to_rfc3339()),
                 d.os_guess,
+                d.alias,
             ],
         )?;
         Ok(())
+    }
+
+    pub fn set_alias(&self, mac: &str, alias: Option<&str>) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE devices SET alias = ?2 WHERE mac = ?1",
+            params![mac, alias],
+        )?;
+        Ok(n)
     }
 
     pub fn mark_disconnected(&self, mac: &str, ts: DateTime<Utc>) -> Result<()> {
@@ -102,7 +119,7 @@ impl Db {
         let d = self
             .conn
             .query_row(
-                r#"SELECT mac, ip, hostname, vendor, first_seen, last_seen, connected, rtt_ms, last_intensive, os_guess
+                r#"SELECT mac, ip, hostname, vendor, first_seen, last_seen, connected, rtt_ms, last_intensive, os_guess, alias
                    FROM devices WHERE mac = ?1"#,
                 params![mac],
                 row_to_device,
@@ -113,7 +130,7 @@ impl Db {
 
     pub fn all_devices(&self) -> Result<Vec<Device>> {
         let mut stmt = self.conn.prepare(
-            r#"SELECT mac, ip, hostname, vendor, first_seen, last_seen, connected, rtt_ms, last_intensive, os_guess
+            r#"SELECT mac, ip, hostname, vendor, first_seen, last_seen, connected, rtt_ms, last_intensive, os_guess, alias
                FROM devices ORDER BY connected DESC, ip ASC"#,
         )?;
         let rows = stmt
@@ -218,6 +235,7 @@ fn row_to_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
         rtt_ms: row.get(7)?,
         last_intensive: last_intensive_s.as_deref().map(parse_ts),
         os_guess: row.get(9)?,
+        alias: row.get(10).ok(),
     })
 }
 

@@ -85,6 +85,18 @@ enum Command {
     Status,
     /// force a rescan now
     Rescan,
+    /// set or clear device alias/nickname
+    Alias {
+        /// target mac
+        #[arg(long)]
+        mac: String,
+        /// new alias. omit or empty to clear
+        #[arg(long)]
+        name: Option<String>,
+        /// clear alias
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -120,6 +132,10 @@ async fn main() -> Result<()> {
         Some(Command::ToggleMute) => client_cmd(IpcCmd::ToggleMute).await,
         Some(Command::Status) => client_cmd(IpcCmd::Status).await,
         Some(Command::Rescan) => client_cmd(IpcCmd::Rescan).await,
+        Some(Command::Alias { mac, name, clear }) => {
+            let alias = if *clear { None } else { name.clone().filter(|s| !s.is_empty()) };
+            client_cmd(IpcCmd::SetAlias { mac: mac.to_lowercase(), alias }).await
+        }
     }
 }
 
@@ -596,6 +612,21 @@ async fn handle_ipc(
             let _ = rescan_tx.try_send(());
             Reply::ok("rescan queued")
         }
+        IpcCmd::SetAlias { mac, alias } => {
+            let mac_l = mac.to_lowercase();
+            let n = {
+                let db_l = db.lock().unwrap();
+                db_l.set_alias(&mac_l, alias.as_deref()).unwrap_or(0)
+            };
+            if n == 0 {
+                return Reply::err("no such mac");
+            }
+            let _ = map_tx.try_send(());
+            Reply::ok(match alias {
+                Some(a) => format!("alias set: {mac_l} -> {a}"),
+                None => format!("alias cleared: {mac_l}"),
+            })
+        }
         IpcCmd::Status => {
             let (total, online, with_ports, with_os) = {
                 let db = db.lock().unwrap();
@@ -737,6 +768,7 @@ async fn run_scan_tick(
                 rtt_ms: hit.rtt_ms,
                 last_intensive,
                 os_guess: existing.as_ref().and_then(|d| d.os_guess.clone()),
+                alias: existing.as_ref().and_then(|d| d.alias.clone()),
             };
 
             {

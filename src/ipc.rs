@@ -17,6 +17,11 @@ pub enum Cmd {
     ToggleMute,
     Status,
     Rescan,
+    SetAlias {
+        mac: String,
+        #[serde(default)]
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
